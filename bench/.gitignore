@@ -1,0 +1,7 @@
+result*
+bench_acorn_result*
+data/clusters/
+*.log
+
+# data directories (local only)
+data/
