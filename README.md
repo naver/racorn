@@ -1,5 +1,8 @@
 # RACORN-1 / ACORN-1 Benchmark Artifact
 
+> **Note:** A revised version of the paper and this artifact is in preparation
+> and is planned for release in November 2026.
+
 This repository is a paper supplementary artifact containing the reference
 implementation and measurement harness for the RACORN-1 / ACORN-1
 algorithms. The algorithm body is provided as a single header
