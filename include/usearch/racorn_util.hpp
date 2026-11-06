@@ -1,18 +1,35 @@
 // RACORN
 // Copyright (c) 2026-present NAVER Corp.
 // Apache-2.0
+//
+// gen_hash_set_gt is derived from: https://github.com/unum-cloud/USearch (Apache License 2.0),
+//   the growing_hash_set_gt of include/usearch/index.hpp.
+// Modified by NAVER Corp.: a generation counter for O(1) clear(); the capacity is fixed.
+//   stride_downsample_inplace is new.
 
 /**
  *  @file   racorn_util.hpp
- *  @brief  Namespace-scope utilities used only by the RACORN-1 search path.
+ *  @brief  Namespace-scope utilities of the ACORN-1 / RACORN-1 / NaviX search
+ *          paths, kept out of the HNSW core of index.hpp.
  *
- *  Included at namespace unum::usearch scope in index.hpp, before index_gt.
- *  Standalone header — safe to include from any translation unit.
+ *  index.hpp includes this file once, at `unum::usearch` namespace scope.
+ *  The include comes after the helpers this file relies on (`ceil2`,
+ *  `exchange`, `hash_gt`, `byte_t`) and before `index_gt`. It is not a
+ *  standalone header: include <usearch/index.hpp> instead.
  *
  *  Contents:
- *    - gen_hash_set_gt           fixed-capacity hash-set with O(1) generation clear
- *    - stride_downsample_inplace in-place stride down-sampling
+ *    - gen_hash_set_gt            fixed-capacity hash set with O(1) generation
+ *                                 clear; the per-cycle 2-hop dedup set
+ *                                 (`context_t::acorn_hop_visits`) of every
+ *                                 filtered path
+ *    - stride_downsample_inplace  in-place stride down-sampling: the 2-hop
+ *                                 passing cap (ACORN-1 and RACORN-1) and the
+ *                                 bridge pool (RACORN-1)
  */
+
+#ifndef UNUM_USEARCH_HPP
+#error "racorn_util.hpp is included by index.hpp; include <usearch/index.hpp> instead"
+#endif
 
 #ifndef USEARCH_RACORN_UTIL_HPP
 #define USEARCH_RACORN_UTIL_HPP
@@ -20,11 +37,11 @@
 /**
  *  @brief  Fixed-capacity hash-set with O(1) generation-counter clear.
  *
- *  Designed for use cases that call `clear()` very frequently within a single query
- *  (e.g., per-cycle dedup sets). Instead of memset-ing the slot array on each clear,
- *  it bumps a per-instance generation counter; slots whose stored generation does not
- *  match the current one are treated as empty. Wraparound triggers a one-time memset
- *  of the generation array to keep correctness.
+ *  Designed for use cases that call `clear()` very often within a single query,
+ *  for example per-cycle dedup sets. A clear does not memset the slot array.
+ *  Instead it bumps a per-instance generation counter. A slot whose stored
+ *  generation does not match the current one is treated as empty. When the
+ *  counter wraps around, one memset of the generation array keeps correctness.
  */
 template <typename element_at, typename hasher_at = hash_gt<element_at>, typename allocator_at = std::allocator<byte_t>>
 class gen_hash_set_gt {
@@ -74,7 +91,7 @@ class gen_hash_set_gt {
         current_gen_ = 0;
     }
 
-    gen_hash_set_gt(std::size_t capacity) noexcept {
+    explicit gen_hash_set_gt(std::size_t capacity) noexcept {
         if (capacity == 0)
             return;
         std::size_t cap = ceil2(capacity);
@@ -143,23 +160,23 @@ class gen_hash_set_gt {
  *  @brief  In-place stride down-sampling: write `data[i] := data[i * stride]`
  *          for `i ∈ [0, limit)`, where `stride = total / limit` (integer div).
  *
- *  Used by RACORN-1 to spread a budget-bounded selection across a larger
- *  candidate pool instead of taking only the head. Two call sites:
- *    - 2-hop passed candidates in `acorn_expand_two_hop_`
- *    - 2-hop failed candidates (bridge pool) in `racorn_fallback_`
+ *  It spreads a budget-bounded selection across a larger candidate pool
+ *  instead of taking only the head. It is used for the 2-hop passed
+ *  candidates in `acorn_expand_two_hop_` and for the bridge pool in
+ *  `racorn_fallback_`.
  *
- *  Safety: `i * stride >= i` always (since `stride >= 1`), so each read
- *  position is at or ahead of the write position — no read-after-write
- *  hazard within the loop.
- *
- *  No-ops when `limit == 0` or `limit >= total` (latter implies `stride == 1`,
- *  i.e. nothing to sub-sample).
+ *  Safety: `stride >= 1`, so `i * stride >= i` always holds. Each read
+ *  position is therefore at or ahead of the write position, and there is no
+ *  read-after-write hazard. The function does nothing when `limit == 0` or
+ *  `limit >= total`.
  */
 template <typename element_at>
 inline void stride_downsample_inplace(element_at* data, std::size_t total, std::size_t limit) noexcept {
     if (limit == 0 || limit >= total)
         return;
     std::size_t const stride = total / limit;
+    if (stride == 1)
+        return; // data[i] = data[i] for every i — nothing to compact
     for (std::size_t i = 0; i < limit; ++i)
         data[i] = data[i * stride];
 }

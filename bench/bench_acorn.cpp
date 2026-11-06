@@ -4,12 +4,27 @@
 
 /**
  * @file bench_acorn.cpp
- * @brief Performance comparison: filtered search with/without ACORN-1
+ * @brief Filtered ANN search benchmark over a selectivity grid: exact, prefilter,
+ *        HNSW, ACORN-1, RACORN-1 and NaviX modes under one controlled predicate.
+ *
+ * Defaults:
+ *   - Dataset: sift, gist, text2image, laion, yfcc (see --dataset; default sift)
+ *   - m=16, ef_construction=100, ef_search=200, k=100
+ *   - Selectivity sweep from 100% down to 0.01% (restrict with --selectivity)
+ *   - filter_first_threshold default 0.3
+ *   - bridge_budget_ratio default 1.0 (used by RACORN-1; ACORN-1 uses 0.0)
+ *   - early_termination_time_threshold off by default (--early-termination-ms)
+ *   - Modes: exact, prefilter, prefilter-scan, hnsw, acorn-1, acorn-1-3hop, racorn-1,
+ *     navix-onehop-s, navix-blind, navix-directed, navix-local, navix-local-paper (see --modes)
+ *   - Index construction: multi-threaded
+ *   - --build-index writes the index volumes and --build-gt writes the ground-truth files.
+ *     A search run loads them when they exist. Otherwise it builds or computes them in memory
  */
 #include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <condition_variable>
 #include <cstdint>
 #include <filesystem>
@@ -60,12 +75,14 @@ static bool load_fvecs(char const* path, std::vector<float>& data, std::size_t& 
     data.resize(count * dims);
     for (std::size_t i = 0; i < count; ++i) {
         int32_t dim_check = 0;
-        ifs.read(reinterpret_cast<char*>(&dim_check), sizeof(dim_check));
+        if (!ifs.read(reinterpret_cast<char*>(&dim_check), sizeof(dim_check)))
+            return false;
         if (static_cast<std::size_t>(dim_check) != dims)
             return false;
-        ifs.read(reinterpret_cast<char*>(data.data() + i * dims), dims * sizeof(float));
+        if (!ifs.read(reinterpret_cast<char*>(data.data() + i * dims), dims * sizeof(float)))
+            return false;
     }
-    return ifs.good() || ifs.eof();
+    return true;
 }
 
 // ── Load fbin file ──────────────────────────────────────────────────────────
@@ -90,8 +107,59 @@ static bool load_fbin(char const* path, std::vector<float>& data, std::size_t& c
     if (max_count > 0 && count > max_count)
         count = max_count;
     data.resize(count * dims);
-    ifs.read(reinterpret_cast<char*>(data.data()), count * dims * sizeof(float));
-    return ifs.good() || ifs.eof();
+    if (!ifs.read(reinterpret_cast<char*>(data.data()), count * dims * sizeof(float)))
+        return false;
+    return true;
+}
+
+// ── u8bin loader (uint8 -> float): [int32 n][int32 d][uint8 n*d] ───────────
+// The big-ann-benchmarks format (YFCC): an fbin header with a uint8 body. The values are
+// promoted to float on load. They are kept as they are (0-255), so the L2 ranking equals the
+// original's.
+static bool load_u8bin(char const* path, std::vector<float>& data, std::size_t& count, std::size_t& dims,
+                       std::size_t max_count = 0) {
+    std::ifstream ifs(path, std::ios::binary);
+    if (!ifs.is_open())
+        return false;
+
+    int32_t n = 0, d = 0;
+    if (!ifs.read(reinterpret_cast<char*>(&n), sizeof(n)))
+        return false;
+    if (!ifs.read(reinterpret_cast<char*>(&d), sizeof(d)))
+        return false;
+    if (n <= 0 || d <= 0 || d > 100000)
+        return false;
+
+    count = static_cast<std::size_t>(n);
+    dims = static_cast<std::size_t>(d);
+    if (max_count > 0 && count > max_count)
+        count = max_count;
+    data.resize(count * dims);
+
+    std::vector<std::uint8_t> chunk(dims);
+    for (std::size_t i = 0; i < count; ++i) {
+        if (!ifs.read(reinterpret_cast<char*>(chunk.data()), dims))
+            return false;
+        for (std::size_t j = 0; j < dims; ++j)
+            data[i * dims + j] = static_cast<float>(chunk[j]);
+    }
+    return true;
+}
+
+// ── L2-normalize a contiguous [n x dims] row-major buffer in-place ──────────
+template <typename T> static void normalize_rows_l2(T* data, std::size_t n, std::size_t dims) {
+    for (std::size_t i = 0; i < n; ++i) {
+        T* v = data + i * dims;
+        T norm_sq = 0;
+        for (std::size_t d = 0; d < dims; ++d)
+            norm_sq += v[d] * v[d];
+        T norm = std::sqrt(norm_sq);
+        if (norm > static_cast<T>(0)) {
+            T inv = static_cast<T>(1) / norm;
+            for (std::size_t d = 0; d < dims; ++d)
+                v[d] *= inv;
+        }
+    }
 }
 
 // ── Vector store ────────────────────────────────────────────────────────────
@@ -104,32 +172,23 @@ template <typename T = float> class vector_store_t {
     T const* row(std::size_t i) const noexcept { return data_.data() + i * dims_; }
 
     // L2-normalize all vectors in-place (unit length)
-    void normalize_l2() {
-        std::size_t n = size();
-        for (std::size_t i = 0; i < n; ++i) {
-            T* v = data_.data() + i * dims_;
-            T norm_sq = 0;
-            for (std::size_t d = 0; d < dims_; ++d)
-                norm_sq += v[d] * v[d];
-            T norm = std::sqrt(norm_sq);
-            if (norm > static_cast<T>(0)) {
-                T inv = static_cast<T>(1) / norm;
-                for (std::size_t d = 0; d < dims_; ++d)
-                    v[d] *= inv;
-            }
-        }
-    }
+    void normalize_l2() { normalize_rows_l2(data_.data(), size(), dims_); }
 
   private:
     std::size_t dims_;
     std::vector<T> data_;
 };
 
-// ── L2 squared metric ───────────────────────────────────────────────────────
-template <typename T = float, typename key_t = std::size_t, typename slot_t = std::size_t> struct l2_metric_t {
+// ── Dataset metric (parameterized on kernel) ────────────────────────────────
+// One metric adapter for both L2-squared and cosine. `kernel_at` is the actual
+// distance functor (e.g. metric_l2sq_gt / metric_cos_gt). The l2_metric_t /
+// cosine_metric_t alias templates below give source-compatible names.
+template <typename kernel_at, typename T = float, typename key_t = std::size_t, typename slot_t = std::size_t>
+struct dataset_metric_t {
     using index_typed_t = index_gt<T, key_t, slot_t>;
     using member_cref_t = typename index_typed_t::member_cref_t;
     using member_citerator_t = typename index_typed_t::member_citerator_t;
+    using kernel_t = kernel_at; // raw distance kernel, for index-free (prefilter) scans
 
     vector_store_t<T> const* store = nullptr;
     std::size_t dimensions = 0;
@@ -137,43 +196,28 @@ template <typename T = float, typename key_t = std::size_t, typename slot_t = st
     T const* row(std::size_t s) const noexcept { return store->row(s); }
 
     float operator()(member_cref_t const& a, member_cref_t const& b) const {
-        return metric_l2sq_gt<T, float>{}(row(get_key(b)), row(get_key(a)), dimensions);
+        return kernel_at{}(row(get_key(b)), row(get_key(a)), dimensions);
     }
-    float operator()(T const* q, member_cref_t const& m) const {
-        return metric_l2sq_gt<T, float>{}(q, row(get_key(m)), dimensions);
-    }
+    float operator()(T const* q, member_cref_t const& m) const { return kernel_at{}(q, row(get_key(m)), dimensions); }
     float operator()(member_citerator_t const& a, member_citerator_t const& b) const {
-        return metric_l2sq_gt<T, float>{}(row(get_key(*b)), row(get_key(*a)), dimensions);
+        return kernel_at{}(row(get_key(*b)), row(get_key(*a)), dimensions);
     }
     float operator()(T const* q, member_citerator_t const& m) const {
-        return metric_l2sq_gt<T, float>{}(q, row(get_key(*m)), dimensions);
+        return kernel_at{}(q, row(get_key(*m)), dimensions);
     }
 };
 
-// ── Cosine metric ───────────────────────────────────────────────────────────
-template <typename T = float, typename key_t = std::size_t, typename slot_t = std::size_t> struct cosine_metric_t {
-    using index_typed_t = index_gt<T, key_t, slot_t>;
-    using member_cref_t = typename index_typed_t::member_cref_t;
-    using member_citerator_t = typename index_typed_t::member_citerator_t;
+template <typename T = float, typename key_t = std::size_t, typename slot_t = std::size_t>
+using l2_metric_t = dataset_metric_t<metric_l2sq_gt<T, float>, T, key_t, slot_t>;
 
-    vector_store_t<T> const* store = nullptr;
-    std::size_t dimensions = 0;
+template <typename T = float, typename key_t = std::size_t, typename slot_t = std::size_t>
+using cosine_metric_t = dataset_metric_t<metric_cos_gt<T, float>, T, key_t, slot_t>;
 
-    T const* row(std::size_t s) const noexcept { return store->row(s); }
-
-    float operator()(member_cref_t const& a, member_cref_t const& b) const {
-        return metric_cos_gt<T, float>{}(row(get_key(b)), row(get_key(a)), dimensions);
-    }
-    float operator()(T const* q, member_cref_t const& m) const {
-        return metric_cos_gt<T, float>{}(q, row(get_key(m)), dimensions);
-    }
-    float operator()(member_citerator_t const& a, member_citerator_t const& b) const {
-        return metric_cos_gt<T, float>{}(row(get_key(*b)), row(get_key(*a)), dimensions);
-    }
-    float operator()(T const* q, member_citerator_t const& m) const {
-        return metric_cos_gt<T, float>{}(q, row(get_key(*m)), dimensions);
-    }
-};
+// Unnormalized inner product (Text2Image's published metric). The distance is
+// `1 - <a,b>`, as in metric_ip_gt. The vectors are NOT normalized: unlike
+// cosine, the magnitude is part of the ranking.
+template <typename T = float, typename key_t = std::size_t, typename slot_t = std::size_t>
+using ip_metric_t = dataset_metric_t<metric_ip_gt<T, float>, T, key_t, slot_t>;
 
 // ── Aligned allocator wrapper ───────────────────────────────────────────────
 template <typename index_at> struct aligned_index_t {
@@ -204,9 +248,14 @@ struct stopwatch_t {
 };
 
 // ── Constants / Defaults ────────────────────────────────────────────────────
-static constexpr std::size_t SIFT_N_MAX = 1'000'000;
+// sift covers both sift1m (--n 1000000) and sift100m (--n 100000000, with
+// --data-dir pointing at the 100M fvecs). The volume and GT names embed N.
+static constexpr std::size_t SIFT_N_MAX = 100'000'000;
 static constexpr std::size_t GIST_N_MAX = 1'000'000;
+static constexpr std::size_t YFCC_N_MAX = 10'000'000; // big-ann filtered track YFCC (192d, uint8)
 static constexpr std::size_t TEXT2IMAGE_N_MAX = 40'000'000;
+static constexpr std::size_t LAION_N_MAX = 25'000'000; // LAION-400M CLIP img_emb prefix (512d, pre-normalized)
+
 static double ACORN_THRESHOLD = 0.3;
 
 // Tuneable defaults (overridable via command-line)
@@ -216,30 +265,114 @@ static std::size_t M_VAL = 16;
 static std::size_t K_VAL = 100;
 static std::size_t EF_CONSTRUCTION_VAL = 100;
 static std::size_t EF_SEARCH_VAL = 200;
-static std::string METRIC_NAME = "";             // "l2" or "cosine" (empty = auto per dataset)
-static std::string DATASET_NAME = "sift";        // "sift" or "text2image"
-static double BRIDGE_BUDGET_RATIO = 1.0;         // RACORN-1 bridge budget ratio
-static double THREE_HOP_THRESHOLD = -1.0;        // 3-hop expansion threshold (-1 = disabled)
-static double FALLBACK_EXACT_THRESHOLD = 0.003;  // RACORN-1+ exact-fallback threshold (0 = disabled)
-static bool RACORN_STRIDE_SAMPLING = true;       // RACORN-1 stride sampling toggle (false → ablation off)
+static std::string METRIC_NAME = "";      // "l2", "cosine" or "ip" (empty = auto per dataset)
+static std::string DATASET_NAME = "sift"; // "sift", "gist", "text2image", "laion" or "yfcc"
 
-// ── Cluster correlation (ACORN paper-style query/filter correlation) ──────
-//   positive  → predicate matches when node.cluster_id == query.cluster_id
-//               (selectivity ~ 1/K, query-correlated).
-//   negative  → predicate matches when node.cluster_id == TARGET[q], where
-//               TARGET[q] is one cluster id chosen at random from
-//               {0..K-1} \ {query.cluster_id} per query, deterministically
-//               seeded. Selectivity ~ 1/K (same magnitude as positive) but
-//               uncorrelated with the query — i.e. the filter looks like a
-//               1/K random partition unrelated to the query's geometry.
-enum class cluster_correlation_t { none, positive, negative };
-static cluster_correlation_t CLUSTER_CORRELATION = cluster_correlation_t::none;
-static std::size_t CLUSTER_K = 100;                        // K used for k-means cluster files
-static std::string CLUSTER_DIR = "data/clusters";          // cluster file directory
-static std::vector<uint32_t> NODE_CLUSTERS;                // base[i] -> cluster id (loaded once)
-static std::vector<uint32_t> QUERY_CLUSTERS;               // queries[i] -> cluster id (loaded once)
-static std::vector<uint32_t> NEGATIVE_TARGET_CLUSTERS;     // queries[i] -> random non-self cluster id (negative mode)
-static std::uint64_t NEGATIVE_TARGET_SEED = 42;            // deterministic per-query target seed
+// RACORN-1 bridge budget ratio: bridge budget = one_hop_count * BRIDGE_BUDGET_RATIO.
+// Passed to index_search_config_t::bridge_budget_ratio for the racorn-1 mode
+// (0.0 = plain ACORN-1). --bridge-budget-ratio overrides it (default 1.0).
+static double BRIDGE_BUDGET_RATIO = 1.0;
+
+// Stride sampling toggle for the two budget-bounded 2-hop selections: the 2-hop
+// passed cap and the RACORN-1 bridge pool. Passed to
+// index_search_config_t::stride_sampling. `false` selects prefix truncation,
+// the ablation baseline of Section VI-F. --stride on|off overrides it (default on).
+static bool STRIDE_SAMPLING = true;
+
+// Base-level average out-degree of the loaded graph, measured with index.stats(0)
+// (edges / nodes). The nominal cap is connectivity_base = 2*M. The RNG pruning
+// heuristic leaves most nodes below it, so the cost model in the paper needs
+// the measured value rather than 2*M. Reported in the JSON config as "mavg"
+// and printed in the header.
+static double MAVG_BASE = 0.0;
+
+// Soft base-layer time budget in milliseconds. Passed to
+// index_search_config_t::early_termination_time_threshold for every non-exact
+// mode. Negative (the default) leaves the budget disabled, so the flag can only
+// ever bound a search. --early-termination-ms overrides it.
+static double EARLY_TERMINATION_MS = -1.0;
+
+static bool early_termination_enabled() { return EARLY_TERMINATION_MS >= 0.0; }
+
+// How full the result heap must be before the soft budget may stop a search. 0 keeps
+// the engine default (ef_search). Setting it to k makes the budget the only
+// stopping rule beyond k results. Every arm then spends the same wall-clock time
+// and is judged on recall (iso-latency mode). --et-min-results.
+static std::size_t ET_MIN_RESULTS = 0;
+
+// With an absolute budget ladder (--early-termination-ms-values), the unbudgeted
+// row of every series is only a reference. It is also by far the most expensive
+// row at large ef. --et-skip-unbudgeted drops it. The flag is ignored when a
+// fraction ladder is given, because the fractions are derived from that row's p50.
+static bool ET_SKIP_UNBUDGETED = false;
+
+// Soft-timeout ladders for the latency mode. Each (selectivity, mode, br, ef)
+// cell first runs with no budget to obtain its own unlimited p50. It then runs
+// once per ladder entry. --early-termination-fractions gives budgets as fractions
+// of that p50, a relative ladder per mode. An absolute ladder would be a no-op
+// for fast modes and a floor for slow ones. --early-termination-ms-values adds
+// absolute budgets. Rows record the budget actually used (`early_termination_ms`,
+// -1 = off).
+static std::vector<double> ET_FRACTIONS;
+static std::vector<double> ET_MS_VALUES;
+
+// --et-anchor <mode>@<ef>:<fractions> (repeatable). The budgets are derived from
+// the prefill p50 of another series, measured in this same process. That p50 is
+// the time at which the series' W first held ef results. It is the earliest
+// deadline at which the series could return a full result set (the reference
+// deadline of Section VI-E). Every graph series of the same selectivity gets
+// anchor_ms × fraction as an absolute budget. So all arms are compared at the same
+// wall-clock ms, and the anchor is read in the same process as the rows it governs.
+// The ladder rows of a series wait until every anchor of its selectivity has been
+// measured. The anchor series must be enabled and must fill W; otherwise the run aborts.
+struct et_anchor_t {
+    std::string mode;              // matched case-insensitively against the series' display name
+    std::size_t ef = 0;            // the anchor series' ef_search
+    std::vector<double> fractions; // > 0, may exceed 1
+    std::string name;              // "<mode>@<ef>" as given, written to each row's et_anchor
+};
+static std::vector<et_anchor_t> ET_ANCHORS;
+
+// --mode-ef <mode>:<list> (repeatable): an ef sweep for one mode only. It overrides
+// --ef-values / --ef-search for that mode. One process can then run HNSW at ef 100
+// and 200 while RACORN-1 runs at ef 200 alone.
+static std::vector<std::pair<std::string, std::vector<std::size_t>>> MODE_EF;
+
+static bool et_ladder_enabled() {
+    return !ET_FRACTIONS.empty() || !ET_MS_VALUES.empty() || !ET_ANCHORS.empty();
+}
+
+// Header-level provenance strings for the JSON config block.
+static std::string et_anchors_spec() {
+    std::ostringstream os;
+    for (std::size_t i = 0; i < ET_ANCHORS.size(); ++i) {
+        if (i)
+            os << ";";
+        os << ET_ANCHORS[i].name << ":";
+        for (std::size_t j = 0; j < ET_ANCHORS[i].fractions.size(); ++j)
+            os << (j ? "," : "") << std::setprecision(6) << ET_ANCHORS[i].fractions[j];
+    }
+    return os.str();
+}
+static std::string mode_ef_spec() {
+    std::ostringstream os;
+    for (std::size_t i = 0; i < MODE_EF.size(); ++i) {
+        if (i)
+            os << ";";
+        os << MODE_EF[i].first << ":";
+        for (std::size_t j = 0; j < MODE_EF[i].second.size(); ++j)
+            os << (j ? "," : "") << MODE_EF[i].second[j];
+    }
+    return os.str();
+}
+
+// The engine takes seconds as a double, so a fractional millisecond budget
+// reaches it unrounded. This matters for traversals that finish in single-digit
+// milliseconds.
+static std::chrono::duration<double> early_termination_threshold() {
+    return std::chrono::duration<double>(EARLY_TERMINATION_MS / 1000.0);
+}
+
 static std::size_t NUM_QUERIES = 100;            // number of benchmark queries
 static std::size_t SEARCH_THREADS = 1;           // parallel search threads
 static bool SEARCH_THREADS_SET = false;          // user explicitly passed --search-threads
@@ -254,9 +387,67 @@ static std::vector<double> FILTER_SELECTIVITIES; // if non-empty, run only these
 static std::size_t BENCH_WARMUP = 3;             // warmup runs before measurement
 static std::size_t BENCH_RUNS = 10;              // measurement runs
 static bool QPS_MODE = false;                    // --qps mode: sweep ef_search, report recall & QPS
+static std::string JSON_PATH = "";               // --json <path>: write structured results as JSON
+static double BUILD_TIME_MS = -1.0;              // index build time in ms (>=0 if built this run, -1 if loaded)
 static bool SKIP_EXACT = false;                  // --skip-exact: skip exact latency benchmarking
 static std::vector<std::string> FILTER_MODES;    // --modes: only run these modes (empty = all)
 static std::vector<std::size_t> QPS_EF_VALUES = {128, 256, 384, 512};
+static bool EF_VALUES_SET = false;               // --ef-values given: latency mode sweeps them too
+static std::vector<double> BBR_VALUES;           // --bridge-budget-ratios: racorn-1 runs once per value
+static double RECALL_TARGET = -1.0;              // --recall-target: stop an ef sweep once avg recall reaches it
+static std::size_t BUILD_THREADS = 0;            // --build-threads: indexing threads (0 = hardware_concurrency)
+static double THREE_HOP_TAU = 1.0;               // --three-hop-threshold: acorn-1-3hop trigger (a multiple of M0)
+static bool PRUNING_FREE = false;                // --pruning-free: ACORN-paper-spec construction (no RNG pruning)
+
+// ── Control predicate kind ──────────────────────────────────────────────────
+// "modulo": key % modulus < threshold (periodic, exact selectivity).
+// "random": every key gets a seed-fixed uniform uint32 attribute at load time
+//           and passes when attr[key] < selectivity * 2^32. This is a uniform
+//           random subset with no key structure (ACORN/NaviX-style random filter).
+//           The realized selectivity is the nominal one ± sampling noise.
+static std::string PREDICATE_KIND = "modulo";
+static std::uint64_t PREDICATE_SEED = 12345;
+static std::vector<std::uint32_t> RANDOM_ATTR; // N_VAL entries when PREDICATE_KIND == "random"
+static bool predicate_random() { return PREDICATE_KIND == "random"; }
+static std::uint32_t attr_threshold_for(double selectivity) {
+    double t = selectivity * 4294967296.0;
+    if (t >= 4294967295.0)
+        return 0xFFFFFFFFu;
+    return static_cast<std::uint32_t>(t);
+}
+// Tag embedded in GT file names so modulo and random GTs coexist.
+static std::string predicate_tag() { return predicate_random() ? "_rnd" + std::to_string(PREDICATE_SEED) : ""; }
+
+// Content fingerprint: the size plus FNV-1a of the first and last 1 MiB. It goes into
+// the GT file name, so a cached GT is tied to the data it was computed from.
+static std::string file_fingerprint(std::string const& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f)
+        return "missing";
+    f.seekg(0, std::ios::end);
+    std::uint64_t size = (std::uint64_t)f.tellg();
+    std::uint64_t h = 1469598103934665603ULL;
+    auto mix = [&](char const* p, std::size_t n) {
+        for (std::size_t i = 0; i < n; ++i)
+            h = (h ^ (unsigned char)p[i]) * 1099511628211ULL;
+    };
+    mix(reinterpret_cast<char const*>(&size), sizeof(size));
+    std::vector<char> buf(1u << 20);
+    std::size_t n1 = (std::size_t)std::min<std::uint64_t>(size, buf.size());
+    f.seekg(0, std::ios::beg);
+    f.read(buf.data(), (std::streamsize)n1);
+    mix(buf.data(), n1);
+    if (size > buf.size()) {
+        f.seekg((std::streamoff)(size - buf.size()), std::ios::beg);
+        f.read(buf.data(), (std::streamsize)buf.size());
+        mix(buf.data(), buf.size());
+    }
+    std::ostringstream o;
+    o << std::hex << std::setfill('0') << std::setw(16) << h;
+    return o.str();
+}
+// Fingerprint of the base vectors this run loads; main() sets it before any GT path is built.
+static std::string BASE_FINGERPRINT = "unset";
 
 // Case-insensitive string compare
 static bool iequals(std::string const& a, std::string const& b) {
@@ -277,14 +468,6 @@ static bool mode_matches(char const* mode_name) {
     return false;
 }
 
-// Keep old names as macros pointing to the variables for minimal code change
-#define N N_VAL
-#define D D_VAL
-#define M M_VAL
-#define K K_VAL
-#define EF_CONSTRUCTION EF_CONSTRUCTION_VAL
-#define EF_SEARCH EF_SEARCH_VAL
-
 using vec_key_t = std::size_t;
 using slot_t = std::size_t;
 using index_t = index_gt<float, vec_key_t, slot_t>;
@@ -294,144 +477,59 @@ using index_t = index_gt<float, vec_key_t, slot_t>;
 struct selectivity_predicate_t {
     std::size_t modulus;
     std::size_t threshold;
+    std::uint32_t const* attr = nullptr; // non-null → random-attribute mode
+    std::uint32_t attr_threshold = 0;
     template <typename member_like_at> bool operator()(member_like_at&& m) const noexcept {
-        return (get_key(m) % modulus) < threshold;
+        auto key = get_key(m);
+        if (attr)
+            return attr[key] < attr_threshold;
+        return (key % modulus) < threshold;
     }
 };
 
-// ── Cluster correlation predicate ──────────────────────────────────────────
-// Always an equality test against a per-query target cluster id. The caller
-// chooses the target:
-//   * positive correlation → target = query's own cluster id (QUERY_CLUSTERS)
-//   * negative correlation → target = random non-self cluster id chosen per
-//                            query at startup (NEGATIVE_TARGET_CLUSTERS)
-// Both modes therefore see the same selectivity scale (~1/K); the difference
-// is whether the surviving cluster is the query's natural one or an arbitrary
-// other cluster.
-struct cluster_predicate_t {
-    uint32_t const* node_clusters;
-    uint32_t target_cluster_id;
-    template <typename member_like_at> bool operator()(member_like_at&& m) const noexcept {
-        return node_clusters[get_key(m)] == target_cluster_id;
+// Builds the predicate for one selectivity case under the active predicate kind.
+static selectivity_predicate_t make_case_predicate(std::size_t modulus, std::size_t threshold, double selectivity) {
+    selectivity_predicate_t p{modulus, threshold};
+    if (predicate_random()) {
+        p.attr = RANDOM_ATTR.data();
+        p.attr_threshold = attr_threshold_for(selectivity);
     }
-};
-
-// Cluster file format:
-//   bytes  0..3  magic "CL01"
-//   bytes  4..7  count (uint32)
-//   bytes  8..11 K (uint32)
-//   bytes 12..15 reserved
-//   bytes 16..   cluster IDs (uint32 × count)
-// `exact_count` selects validation mode:
-//   true  → file count must equal `expected_min_count` (used for base file)
-//   false → file count must be ≥ `expected_min_count` (used for query file —
-//                                                       q_max-built file with
-//                                                       smaller bench nq).
-static bool load_cluster_file(std::string const& path, std::vector<uint32_t>& out, std::size_t expected_min_count,
-                              std::size_t expected_k, bool exact_count = true) {
-    std::ifstream ifs(path, std::ios::binary);
-    if (!ifs.is_open()) {
-        std::cerr << "Cluster file not found: " << path << "\n"
-                  << "  Build with: python cpp/scripts/build_clusters.py "
-                  << "--dataset <name> --n <N> --k <K>\n";
-        return false;
-    }
-    char magic[4] = {};
-    uint32_t count = 0, k = 0, reserved = 0;
-    ifs.read(magic, 4);
-    ifs.read(reinterpret_cast<char*>(&count), sizeof(count));
-    ifs.read(reinterpret_cast<char*>(&k), sizeof(k));
-    ifs.read(reinterpret_cast<char*>(&reserved), sizeof(reserved));
-    if (!ifs || std::string(magic, 4) != "CL01") {
-        std::cerr << "Bad cluster file (magic / header): " << path << "\n";
-        return false;
-    }
-    bool count_ok = exact_count ? (count == expected_min_count) : (count >= expected_min_count);
-    if (!count_ok) {
-        std::cerr << "Cluster file count mismatch: expected " << (exact_count ? "" : ">=") << expected_min_count
-                  << " got " << count << " (" << path << ")\n";
-        return false;
-    }
-    if (k != expected_k) {
-        std::cerr << "Cluster file K mismatch: expected " << expected_k << " got " << k << " (" << path << ")\n";
-        return false;
-    }
-    out.resize(count);
-    ifs.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(count) * sizeof(uint32_t));
-    return ifs.good() || ifs.eof();
+    return p;
 }
 
-// ── Negative-correlation target picker ─────────────────────────────────────
-// For each query, picks a random cluster id from {0..K-1} \ {query's own},
-// using a deterministic per-query seed so a rerun with the same seed produces
-// the same targets (and so the value at index q is independent of --nq).
-static bool populate_negative_targets(std::vector<uint32_t> const& query_clusters, std::size_t k_clusters,
-                                      std::uint64_t seed, std::vector<uint32_t>& out) {
-    if (k_clusters < 2) {
-        std::cerr << "negative correlation requires --cluster-k >= 2 (got " << k_clusters << ")\n";
-        return false;
-    }
-    out.resize(query_clusters.size());
-    for (std::size_t qi = 0; qi < query_clusters.size(); ++qi) {
-        std::mt19937_64 rng(seed + static_cast<std::uint64_t>(qi));
-        std::uniform_int_distribution<std::uint32_t> dist(0, static_cast<std::uint32_t>(k_clusters - 2));
-        std::uint32_t my = query_clusters[qi];
-        std::uint32_t r = dist(rng);
-        // map r ∈ [0, K-2] onto [0, K-1] \ {my} by skipping `my`
-        out[qi] = (my < k_clusters && r >= my) ? r + 1 : r;
-    }
-    return true;
+// Key-level pass test for the prefilter's passing-key scan. Same rule as the predicate.
+static inline bool key_passes(std::size_t key, std::size_t modulus, std::size_t threshold, double selectivity) {
+    if (predicate_random())
+        return RANDOM_ATTR[key] < attr_threshold_for(selectivity);
+    return (key % modulus) < threshold;
 }
 
-// ── Cluster-mode selectivity statistics ─────────────────────────────────────
-// Used by cluster-correlation experiments. Each query's "selectivity" is the
-// fraction of base nodes whose cluster id equals that query's target cluster
-// (= query's own cluster id in positive mode, a random non-self cluster in
-// negative mode). We report mean and p50/p90/p95/p99 to give a feel for the
-// per-query distribution (cluster sizes vary with K).
-struct cluster_sel_stats_t {
-    double mean = 0.0;
-    double p50 = 0.0;
-    double p90 = 0.0;
-    double p95 = 0.0;
-    double p99 = 0.0;
-    double max = 0.0;
+// ── Key-based neighbor comparator ──────────────────────────────────────────
+// Sorts neighbors by vector key (ascending). Passed to index.search() as
+// neighbor_cmp, so the search path activates the sorted_data + sort_neighbors
+// branches in usearch. The modulo predicate uses (key % modulus < threshold).
+// A key-ascending sort therefore lays out the passing slots in contiguous runs
+// within each candidate's neighbor list: the predicate-passing prefix tends to
+// be denser up front.
+struct key_cmp_t {
+    template <typename member_like_at> bool operator()(member_like_at&& a, member_like_at&& b) const noexcept {
+        return static_cast<vec_key_t>(a.key) < static_cast<vec_key_t>(b.key);
+    }
 };
 
-static cluster_sel_stats_t compute_cluster_selectivity_stats(std::vector<uint32_t> const& node_clusters,
-                                                             std::vector<uint32_t> const& target_clusters,
-                                                             std::size_t k_clusters, std::size_t n_base) {
-    cluster_sel_stats_t out;
-    if (target_clusters.empty() || n_base == 0)
-        return out;
-    std::vector<std::size_t> sizes(k_clusters, 0);
-    for (uint32_t cid : node_clusters)
-        if (cid < k_clusters)
-            ++sizes[cid];
-    std::vector<double> per_q;
-    per_q.reserve(target_clusters.size());
-    for (uint32_t tc : target_clusters) {
-        std::size_t match = (tc < k_clusters) ? sizes[tc] : 0;
-        per_q.push_back(static_cast<double>(match) / static_cast<double>(n_base));
-    }
-    double sum = 0.0;
-    for (double s : per_q)
-        sum += s;
-    out.mean = sum / static_cast<double>(per_q.size());
-    std::vector<double> sorted = per_q;
-    std::sort(sorted.begin(), sorted.end());
-    auto pct = [&](double p) -> double {
-        std::size_t idx = static_cast<std::size_t>(p * static_cast<double>(sorted.size() - 1) + 0.5);
-        if (idx >= sorted.size())
-            idx = sorted.size() - 1;
-        return sorted[idx];
-    };
-    out.p50 = pct(0.50);
-    out.p90 = pct(0.90);
-    out.p95 = pct(0.95);
-    out.p99 = pct(0.99);
-    out.max = sorted.back();
-    return out;
+// When true, searches pass `key_cmp_t` as neighbor_cmp (key-ascending neighbor
+// sort). When false, neighbor_cmp defaults to dummy (no sort). Toggled by the
+// `--cmpkey` CLI flag. Default: off.
+static bool USE_CMPKEY = false;
+
+// Single search entry point that honors USE_CMPKEY. Both branches return the
+// same search_result_t (the return type is independent of neighbor_cmp).
+template <typename index_at, typename query_at, typename metric_at, typename config_at, typename predicate_at>
+static inline auto bench_search(index_at& index, query_at&& query, std::size_t k, metric_at&& metric, config_at&& cfg,
+                                predicate_at&& pred) {
+    if (USE_CMPKEY)
+        return index.search(query, k, metric, cfg, pred, dummy_prefetch_t{}, dummy_preevaluate_t{}, key_cmp_t{});
+    return index.search(query, k, metric, cfg, pred, dummy_prefetch_t{}, dummy_preevaluate_t{});
 }
 
 // ── Compute recall against ground truth ─────────────────────────────────────
@@ -446,27 +544,146 @@ double compute_recall(result_at const& result, std::vector<vec_key_t> const& gt,
     return limit > 0 ? static_cast<double>(hits) / static_cast<double>(limit) : 0.0;
 }
 
+// Recall of the k best entries of `W` as it stood when it first filled, i.e. at the instant
+// of `prefill_ms` (search_result_t::fill_at). Scored the same way compute_recall scores the
+// final results. NaN when `W` never filled or the search kept no copy.
+template <typename result_at>
+double compute_fill_recall(result_at const& result, std::vector<vec_key_t> const& gt, std::size_t k) {
+    std::size_t const n = result.fill_count;
+    if (!n)
+        return std::numeric_limits<double>::quiet_NaN();
+    std::vector<std::pair<double, vec_key_t>> w;
+    w.reserve(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        auto m = result.fill_at(i);
+        w.emplace_back(static_cast<double>(m.distance), m.member.key);
+    }
+    std::size_t const take = std::min(n, k);
+    std::partial_sort(w.begin(), w.begin() + take, w.end(),
+                      [](std::pair<double, vec_key_t> const& a, std::pair<double, vec_key_t> const& b) {
+                          return a.first < b.first;
+                      });
+    std::size_t limit = std::min({gt.size(), k});
+    std::unordered_set<vec_key_t> gt_set(gt.begin(), gt.begin() + limit);
+    std::size_t hits = 0;
+    for (std::size_t i = 0; i < take; ++i)
+        if (gt_set.count(w[i].second))
+            ++hits;
+    return limit > 0 ? static_cast<double>(hits) / static_cast<double>(limit) : 0.0;
+}
+
 // ── Search result summary ───────────────────────────────────────────────────
 struct search_result_summary_t {
     std::string label;
+    std::string mode; // display name, e.g. "HNSW"
     double selectivity;
-    bool acorn;
+    std::size_t ef_search;      // 0 for ef-independent modes (Exact, Prefilter)
+    double bridge_budget_ratio; // >0 only for RACORN-1 rows
     bool exact;
-    double latency_ms;
+    double latency_ms; // median
+    double latency_p50;
+    double latency_p90;
+    double latency_p99;
+    double qps; // batch throughput: median over RUNS of nq / batch_wall_time
     double dist_computed;
     double nodes_visited;
-    double recall;
-    double predicate_evals; // ACORN-1 / RACORN-1 / 3-hop only; 0 otherwise
-    double fallback_count;
-    double fallback_selectivity;
-    bool fallback_to_exact; // RACORN-1+ exact-fallback fired for any query
+    // Per-query visit percentiles (higher = more cycles). The mean alone hides
+    // whether the ef/s relation holds query by query (Section IV-D).
+    double visited_p01; // 1% of queries below this
+    double visited_p10;
+    double visited_p50;
+    double visited_p90;
+    double visited_p99;
+    double recall; // avg
+    double recall_p50;
+    double recall_p90;
+    double recall_p99;
+    double predicate_evals; // ACORN-1/RACORN-1 only; 0 otherwise
+    double fallback_count;  // RACORN-1 only; 0 otherwise
+    // Expansion size |expand(u)|: what one EXPAND returns, averaged over a
+    // query's cycles and then summarized across queries. `bridge_size` is the
+    // RACORN-1 bridge spend on the same cycles (0 for ACORN-1). It is reported
+    // apart because bridges do not contribute results. `promoted` is the share
+    // that survived the visited-set dedup. All 0 on the HNSW/prefilter/exact paths.
+    double expand_size_mean;
+    double expand_size_p10;
+    double expand_size_p50;
+    double expand_size_p90;
+    double bridge_size_mean;
+    double bridge_size_p10;
+    double bridge_size_p50;
+    double bridge_size_p90;
+    // Bridges the fallback sampled and measured. The radius test rejects the gap
+    // to bridge_size_mean, so this is the figure that distance accounting needs.
+    double bridge_sampled_mean;
+    double promoted_mean;
+    // Base-loop cycles alone. `nodes_visited` also carries the upper-layer
+    // descent, so only this figure composes with the per-cycle means above.
+    double expand_cycles;
+    // Share of base-loop cycles whose EXPAND returned nothing.
+    double expand_empty_rate;
+    // Phase split at the moment W filled, and why the base loop stopped.
+    // `prefill` is the stretch while W still held fewer than ef entries.
+    double cycles_prefill;
+    double cycles_postfill;
+    double prefill_expand_mean;
+    double prefill_bridge_mean;
+    double prefill_fire_rate;
+    double postfill_expand_mean;
+    double postfill_bridge_mean;
+    double postfill_fire_rate;
+    // Shares across queries; exactly one stop reason fires per query.
+    double stop_radius_rate;
+    double stop_queue_rate;
+    double stop_budget_rate;
+    double never_full_rate;
+    // Time from base-layer entry to the moment `W` first held `ef` results.
+    // This is the earliest deadline at which this arm could return a full result
+    // set. Queries that never filled are excluded; they are `never_full_rate`.
+    double prefill_ms_mean;
+    double prefill_ms_p50;
+    double prefill_ms_p90;
+    double prefill_ms_p99;
+    // Distance computations and predicate evaluations per base cycle, by phase,
+    // plus the entry descent's distance computations (outside the loop).
+    double dist_descent;
+    double prefill_dist_mean;
+    double postfill_dist_mean;
+    double prefill_pred_mean;
+    double postfill_pred_mean;
+    // Share of queries whose base-layer traversal hit the soft time budget.
+    // Always 0 while --early-termination-ms is unset.
+    double early_term_rate;
+    double results_returned;
+    std::size_t threads;
+    std::size_t num_queries;
+    double early_termination_ms = -1.0; // soft budget used for this row; -1 = none
+    // Wall time to build the prefilter's passing-key list, i.e. the cost this
+    // baseline is granted for free. The control predicate is one attribute
+    // column shared by every query, so the list is built once per cell and
+    // reused. Reporting it lets a reader amortize it over the query batch.
+    // Prefilter rows only; -1 elsewhere.
+    double passing_build_ms = -1.0;
+    // Provenance of an --et-anchor budget: the anchor series ("hnsw@200") and the
+    // fraction of its prefill p50 this row's budget was. Empty / NaN elsewhere.
+    // Appended last so the positional initializers above stay valid.
+    std::string et_anchor{};
+    double et_fraction = std::numeric_limits<double>::quiet_NaN();
+    // Measured at the instant `W` first held `ef` entries, the instant of prefill_ms.
+    // `recall_at_fill` is the recall of its k best entries (mean over queries). The two p50
+    // fields are the per-query totals of base-layer distance computations and predicate
+    // evaluations up to then (median over queries). Queries whose `W` never filled are
+    // excluded, as for prefill_ms. NaN for rows without a base-layer loop. Appended last for
+    // the same reason as et_anchor.
+    double recall_at_fill = std::numeric_limits<double>::quiet_NaN();
+    double prefill_dist_p50 = std::numeric_limits<double>::quiet_NaN();
+    double prefill_pred_p50 = std::numeric_limits<double>::quiet_NaN();
 };
 
 // ── Median helper ───────────────────────────────────────────────────────────
-// Strips NaN entries first so callers can pass per-query stats that include
-// NaN sentinels (e.g. fallback_selectivity for queries that never entered the
-// racorn fallback path) without corrupting nth_element's strict-weak-ordering
-// requirement. Returns NaN when every entry is NaN (i.e. nothing to summarize).
+// Strips NaN entries first. Callers can then pass per-query stats that include
+// NaN sentinels without breaking the strict-weak-ordering requirement of
+// nth_element. Returns NaN when every entry is NaN (i.e. nothing to summarize).
 static double median(std::vector<double>& v) {
     v.erase(std::remove_if(v.begin(), v.end(), [](double x) { return std::isnan(x); }), v.end());
     if (v.empty())
@@ -497,13 +714,122 @@ static double percentile_sorted(std::vector<double> const& sorted_v, double p) {
     return sorted_v[lo] * (1.0 - frac) + sorted_v[hi] * frac;
 }
 
+// ── JSON output ─────────────────────────────────────────────────────────────
+static std::string json_escape(std::string const& s) {
+    std::string o;
+    o.reserve(s.size() + 8);
+    for (char c : s) {
+        if (c == '"' || c == '\\') {
+            o.push_back('\\');
+            o.push_back(c);
+        } else if (c == '\n')
+            o += "\\n";
+        else
+            o.push_back(c);
+    }
+    return o;
+}
+
+static void write_json_results(std::string const& path, std::vector<search_result_summary_t> const& summaries) {
+    std::ofstream ofs(path);
+    if (!ofs) {
+        std::cerr << "Failed to open --json path: " << path << "\n";
+        return;
+    }
+    auto num = [](double v) -> std::string {
+        if (std::isnan(v))
+            return "null";
+        std::ostringstream os;
+        os << std::setprecision(6) << v;
+        return os.str();
+    };
+    ofs << "{\n  \"config\": {\n";
+    ofs << "    \"dataset\": \"" << json_escape(DATASET_NAME) << "\",\n";
+    ofs << "    \"n\": " << N_VAL << ", \"d\": " << D_VAL << ", \"m\": " << M_VAL
+        << ", \"ef_construction\": " << EF_CONSTRUCTION_VAL << ",\n";
+    ofs << "    \"k\": " << K_VAL << ", \"ef_search\": " << EF_SEARCH_VAL << ", \"metric\": \""
+        << json_escape(METRIC_NAME) << "\",\n";
+    ofs << "    \"filter_first_threshold\": " << num(ACORN_THRESHOLD)
+        << ", \"bridge_budget_ratio\": " << num(BRIDGE_BUDGET_RATIO)
+        << ", \"stride_sampling\": " << (STRIDE_SAMPLING ? "true" : "false")
+        << ", \"mavg\": " << std::fixed << std::setprecision(3) << MAVG_BASE
+        << ", \"early_termination_ms\": " << num(EARLY_TERMINATION_MS)
+        << ", \"et_min_results\": " << ET_MIN_RESULTS << ",\n";
+    ofs << "    \"et_anchors\": \"" << json_escape(et_anchors_spec()) << "\", \"mode_ef\": \""
+        << json_escape(mode_ef_spec()) << "\",\n";
+    ofs << "    \"warmup\": " << BENCH_WARMUP << ", \"runs\": " << BENCH_RUNS
+        << ", \"search_threads\": " << SEARCH_THREADS << ",\n";
+    ofs << "    \"cmpkey\": " << (USE_CMPKEY ? "true" : "false") << ", \"build_time_ms\": " << num(BUILD_TIME_MS)
+        << ", \"pruning_free\": " << (PRUNING_FREE ? "true" : "false") << ",\n";
+    ofs << "    \"predicate\": \"" << json_escape(PREDICATE_KIND) << "\", \"seed\": " << PREDICATE_SEED
+        << ", \"three_hop_threshold\": " << num(THREE_HOP_TAU)
+        << "\n  },\n  \"results\": [\n";
+    for (std::size_t i = 0; i < summaries.size(); ++i) {
+        auto const& r = summaries[i];
+        ofs << "    {\"label\": \"" << json_escape(r.label) << "\", \"mode\": \"" << json_escape(r.mode)
+            << "\", \"selectivity\": " << num(r.selectivity) << ", \"ef_search\": " << r.ef_search
+            << ", \"bridge_budget_ratio\": " << num(r.bridge_budget_ratio)
+            << ", \"exact\": " << (r.exact ? "true" : "false")
+            << ", \"threads\": " << r.threads << ", \"num_queries\": " << r.num_queries
+            << ", \"latency_ms\": " << num(r.latency_ms) << ", \"latency_p50\": " << num(r.latency_p50)
+            << ", \"latency_p90\": " << num(r.latency_p90) << ", \"latency_p99\": " << num(r.latency_p99)
+            << ", \"qps\": " << num(r.qps)
+            << ", \"recall\": " << num(r.recall) << ", \"recall_p50\": " << num(r.recall_p50)
+            << ", \"recall_p90\": " << num(r.recall_p90) << ", \"recall_p99\": " << num(r.recall_p99)
+            << ", \"dist_computed\": " << num(r.dist_computed) << ", \"nodes_visited\": " << num(r.nodes_visited)
+            << ", \"visited_p01\": " << num(r.visited_p01) << ", \"visited_p10\": " << num(r.visited_p10)
+            << ", \"visited_p50\": " << num(r.visited_p50) << ", \"visited_p90\": " << num(r.visited_p90)
+            << ", \"visited_p99\": " << num(r.visited_p99)
+            << ", \"predicate_evals\": " << num(r.predicate_evals) << ", \"fallback_count\": " << num(r.fallback_count)
+            << ", \"expand_size_mean\": " << num(r.expand_size_mean) << ", \"expand_size_p10\": " << num(r.expand_size_p10)
+            << ", \"expand_size_p50\": " << num(r.expand_size_p50) << ", \"expand_size_p90\": " << num(r.expand_size_p90)
+            << ", \"bridge_size_mean\": " << num(r.bridge_size_mean) << ", \"bridge_size_p10\": " << num(r.bridge_size_p10)
+            << ", \"bridge_size_p50\": " << num(r.bridge_size_p50) << ", \"bridge_size_p90\": " << num(r.bridge_size_p90)
+            << ", \"bridge_sampled_mean\": " << num(r.bridge_sampled_mean)
+            << ", \"promoted_mean\": " << num(r.promoted_mean)
+            << ", \"expand_cycles\": " << num(r.expand_cycles)
+            << ", \"expand_empty_rate\": " << num(r.expand_empty_rate)
+            << ", \"cycles_prefill\": " << num(r.cycles_prefill)
+            << ", \"cycles_postfill\": " << num(r.cycles_postfill)
+            << ", \"prefill_expand_mean\": " << num(r.prefill_expand_mean)
+            << ", \"prefill_bridge_mean\": " << num(r.prefill_bridge_mean)
+            << ", \"prefill_fire_rate\": " << num(r.prefill_fire_rate)
+            << ", \"postfill_expand_mean\": " << num(r.postfill_expand_mean)
+            << ", \"postfill_bridge_mean\": " << num(r.postfill_bridge_mean)
+            << ", \"postfill_fire_rate\": " << num(r.postfill_fire_rate)
+            << ", \"stop_radius_rate\": " << num(r.stop_radius_rate)
+            << ", \"stop_queue_rate\": " << num(r.stop_queue_rate)
+            << ", \"stop_budget_rate\": " << num(r.stop_budget_rate)
+            << ", \"never_full_rate\": " << num(r.never_full_rate)
+            << ", \"prefill_ms_mean\": " << num(r.prefill_ms_mean)
+            << ", \"prefill_ms_p50\": " << num(r.prefill_ms_p50)
+            << ", \"prefill_ms_p90\": " << num(r.prefill_ms_p90)
+            << ", \"prefill_ms_p99\": " << num(r.prefill_ms_p99)
+            << ", \"recall_at_fill\": " << num(r.recall_at_fill)
+            << ", \"prefill_dist_p50\": " << num(r.prefill_dist_p50)
+            << ", \"prefill_pred_p50\": " << num(r.prefill_pred_p50)
+            << ", \"dist_descent\": " << num(r.dist_descent)
+            << ", \"prefill_dist_mean\": " << num(r.prefill_dist_mean)
+            << ", \"postfill_dist_mean\": " << num(r.postfill_dist_mean)
+            << ", \"prefill_pred_mean\": " << num(r.prefill_pred_mean)
+            << ", \"postfill_pred_mean\": " << num(r.postfill_pred_mean)
+            << ", \"early_term_rate\": " << num(r.early_term_rate)
+            << ", \"early_termination_ms\": " << num(r.early_termination_ms)
+            << ", \"et_anchor\": " << (r.et_anchor.empty() ? std::string("null") : "\"" + json_escape(r.et_anchor) + "\"")
+            << ", \"et_fraction\": " << num(r.et_fraction)
+            << ", \"passing_build_ms\": " << num(r.passing_build_ms)
+            << ", \"results_returned\": " << num(r.results_returned) << "}" << (i + 1 < summaries.size() ? "," : "")
+            << "\n";
+    }
+    ofs << "  ]\n}\n";
+    std::cout << "Wrote JSON results to " << path << " (" << summaries.size() << " rows)\n";
+}
+
 // ── Persistent worker pool ──────────────────────────────────────────────────
-// Pre-spawns `st` worker threads that wait on a condition variable for each
-// new batch. Each batch dispatches `fn(q, tid)` over query indices
-// [chunk*tid, chunk*tid+chunk) for tid in [0, st). Replaces the previous
-// per-iteration spawn/join — the spawn cost was visible in QPS-mode
-// wall-clock (timer wraps the entire batch), and per-batch CPU placement
-// was inconsistent because the OS picks CPUs anew at every spawn.
+// Pre-spawns `st` worker threads. They wait on a condition variable for each
+// new batch. Each batch dispatches `fn(q, tid)` over the query indices
+// [chunk*tid, chunk*tid+chunk) for tid in [0, st). So no thread is spawned
+// or joined inside a timed batch.
 class query_pool_t {
   public:
     query_pool_t(std::size_t st, std::size_t nq) : st_(st), nq_(nq), chunk_size_((nq + st - 1) / st) {
@@ -589,33 +915,39 @@ class query_pool_t {
 };
 
 // ── Run a single search test (multi-query, median aggregation) ──────────────
-// `make_predicate(query_idx)` is invoked per query so cluster-correlation
-// mode can swap in a query-specific predicate. For modulo predicates the
-// caller's factory just returns the same fixed predicate object every call.
+// `make_predicate(query_idx)` is invoked per query. The caller's factory returns
+// the same fixed predicate object for every query (see make_modulo_factory).
+// `bridge_budget_ratio` selects ACORN-1 (0.0) vs RACORN-1 (>0.0).
 template <typename metric_at, typename make_predicate_at>
 search_result_summary_t run_search(index_t& index, metric_at& metric, std::vector<float const*> const& queries,
                                    std::size_t k, std::size_t ef_search, make_predicate_at&& make_predicate,
-                                   double two_hop_threshold, bool racorn, bool is_exact, char const* label,
-                                   double selectivity, bool is_acorn, double fallback_exact_threshold,
-                                   std::vector<std::vector<vec_key_t>> const& ground_truths) {
+                                   double filter_first_threshold, bool is_exact, char const* label, char const* mode,
+                                   double selectivity, double bridge_budget_ratio,
+                                   std::vector<std::vector<vec_key_t>> const& ground_truths,
+                                   std::size_t navix_heuristic = 0, double early_ms = EARLY_TERMINATION_MS,
+                                   double three_hop = 0.0) {
 
     index_search_config_t cfg;
     cfg.expansion = ef_search;
-    cfg.two_hop_threshold = two_hop_threshold;
-    cfg.racorn = racorn;
-    cfg.bridge_budget_ratio = BRIDGE_BUDGET_RATIO;
-    cfg.three_hop_threshold = THREE_HOP_THRESHOLD;
-    cfg.fallback_exact_threshold = fallback_exact_threshold;
-    cfg.racorn_stride_sampling = RACORN_STRIDE_SAMPLING;
+    cfg.filter_first_threshold = filter_first_threshold;
     cfg.exact = is_exact;
+    cfg.bridge_budget_ratio = bridge_budget_ratio;
+    cfg.stride_sampling = STRIDE_SAMPLING;
+    cfg.navix_heuristic = navix_heuristic;
+    cfg.three_hop_threshold = three_hop;
+    cfg.early_termination_time_threshold = std::chrono::duration<double>(early_ms >= 0.0 ? early_ms / 1000.0 : -1.0);
+    cfg.early_termination_min_results = ET_MIN_RESULTS;
+    // Keep a copy of W at the instant it fills, for recall_at_fill: one copy of ef entries per
+    // query, taken right after the prefill_ms clock read.
+    cfg.fill_snapshot = true;
 
     std::size_t nq = queries.size();
     std::size_t st = std::min(SEARCH_THREADS, nq);
     int WARMUP = static_cast<int>(BENCH_WARMUP);
     int RUNS = static_cast<int>(BENCH_RUNS);
 
-    // Persistent worker pool — spawned once per run_search, reused across all
-    // WARMUP/RUNS iterations. Avoids per-iteration spawn/join overhead and
+    // Persistent worker pool: spawned once per run_search and reused across all
+    // WARMUP/RUNS iterations. This avoids per-iteration spawn/join overhead and
     // keeps thread/CPU placement more stable between iterations.
     query_pool_t pool(st, nq);
     auto parallel_queries = [&](auto&& fn) { pool.run(std::forward<decltype(fn)>(fn)); };
@@ -625,7 +957,7 @@ search_result_summary_t run_search(index_t& index, metric_at& metric, std::vecto
             auto c = cfg;
             c.thread = tid;
             auto pred = make_predicate(q);
-            auto r = index.search(queries[q], k, metric, c, pred);
+            auto r = bench_search(index, queries[q], k, metric, c, pred);
             (void)r;
         });
     }
@@ -637,10 +969,25 @@ search_result_summary_t run_search(index_t& index, metric_at& metric, std::vecto
     std::vector<std::vector<double>> per_q_visited(nq);
     std::vector<std::vector<double>> per_q_recall(nq);
     std::vector<std::vector<double>> per_q_result_count(nq);
-    std::vector<std::vector<double>> per_q_fb_count(nq);
-    std::vector<std::vector<double>> per_q_fb_selectivity(nq);
     std::vector<std::vector<double>> per_q_pred_evals(nq);
-    std::atomic<bool> any_fallback_to_exact{false};
+    std::vector<std::vector<double>> per_q_fallback(nq);
+    std::vector<std::vector<double>> per_q_early_term(nq);
+    // Per-cycle means for this query: sum / cycles. NaN when the query ran no
+    // ACORN cycle (HNSW path, exact). median() then drops it instead of pulling
+    // the summary toward 0.
+    std::vector<std::vector<double>> per_q_expand(nq);
+    std::vector<std::vector<double>> per_q_bridge(nq);
+    std::vector<std::vector<double>> per_q_bridge_sampled(nq);
+    std::vector<std::vector<double>> per_q_expand_cycles(nq);
+    std::vector<std::vector<double>> per_q_expand_empty(nq);
+    std::vector<std::vector<double>> per_q_cyc_pre(nq), per_q_cyc_post(nq);
+    std::vector<std::vector<double>> per_q_pre_exp(nq), per_q_pre_br(nq), per_q_pre_fire(nq);
+    std::vector<std::vector<double>> per_q_post_exp(nq), per_q_post_br(nq), per_q_post_fire(nq);
+    std::vector<std::vector<double>> per_q_stop_r(nq), per_q_stop_q(nq), per_q_stop_b(nq), per_q_nfull(nq);
+    std::vector<std::vector<double>> per_q_prefill_ms(nq);
+    std::vector<std::vector<double>> per_q_fill_recall(nq), per_q_fill_dist(nq), per_q_fill_pred(nq);
+    std::vector<std::vector<double>> per_q_desc(nq), per_q_pre_dist(nq), per_q_post_dist(nq), per_q_pre_pred(nq), per_q_post_pred(nq);
+    std::vector<std::vector<double>> per_q_promoted(nq);
 
     for (std::size_t q = 0; q < nq; ++q) {
         per_q_ms[q].reserve(RUNS);
@@ -648,54 +995,239 @@ search_result_summary_t run_search(index_t& index, metric_at& metric, std::vecto
         per_q_visited[q].reserve(RUNS);
         per_q_recall[q].reserve(RUNS);
         per_q_result_count[q].reserve(RUNS);
-        per_q_fb_count[q].reserve(RUNS);
-        per_q_fb_selectivity[q].reserve(RUNS);
         per_q_pred_evals[q].reserve(RUNS);
+        per_q_fallback[q].reserve(RUNS);
+        per_q_early_term[q].reserve(RUNS);
+        per_q_expand[q].reserve(RUNS);
+        per_q_bridge[q].reserve(RUNS);
+        per_q_bridge_sampled[q].reserve(RUNS);
+        per_q_expand_cycles[q].reserve(RUNS);
+        per_q_expand_empty[q].reserve(RUNS);
+        for (auto* v : {&per_q_cyc_pre, &per_q_cyc_post, &per_q_pre_exp, &per_q_pre_br, &per_q_pre_fire,
+                        &per_q_post_exp, &per_q_post_br, &per_q_post_fire, &per_q_stop_r, &per_q_stop_q,
+                        &per_q_stop_b, &per_q_nfull, &per_q_prefill_ms, &per_q_desc, &per_q_pre_dist, &per_q_post_dist,
+                        &per_q_pre_pred, &per_q_post_pred, &per_q_fill_recall, &per_q_fill_dist, &per_q_fill_pred})
+            (*v)[q].reserve(RUNS);
+        per_q_promoted[q].reserve(RUNS);
     }
 
+    // Each measurement run is a full nq batch, so timing the whole batch here
+    // yields the QPS figure for free. The per-query stopwatch bookkeeping adds
+    // sub-microsecond overhead per query, negligible against ms-scale queries.
+    std::vector<double> batch_qps;
+    batch_qps.reserve(RUNS);
     for (int i = 0; i < RUNS; ++i) {
+        stopwatch_t batch_timer;
         parallel_queries([&](std::size_t q, std::size_t tid) {
             auto c = cfg;
             c.thread = tid;
             auto pred = make_predicate(q);
             stopwatch_t t;
-            auto r = index.search(queries[q], k, metric, c, pred);
+            auto r = bench_search(index, queries[q], k, metric, c, pred);
             per_q_ms[q].push_back(t.elapsed_ms());
             per_q_result_count[q].push_back(static_cast<double>(r.size()));
             per_q_distances[q].push_back(static_cast<double>(r.computed_distances));
             per_q_visited[q].push_back(static_cast<double>(r.visited_members));
-            per_q_fb_count[q].push_back(static_cast<double>(r.fallback_count));
-            per_q_fb_selectivity[q].push_back(r.fallback_selectivity);
             per_q_pred_evals[q].push_back(static_cast<double>(r.predicate_evaluations));
-            if (r.fallback_to_exact)
-                any_fallback_to_exact.store(true, std::memory_order_relaxed);
+            per_q_fallback[q].push_back(static_cast<double>(r.fallback_count));
+            double const cycles = static_cast<double>(r.expansion_cycles);
+            per_q_expand_cycles[q].push_back(cycles);
+            per_q_expand_empty[q].push_back(cycles > 0 ? static_cast<double>(r.expansion_empty_cycles) / cycles : NAN);
+            double const cpre = static_cast<double>(r.cycles_prefill);
+            double const cpost = cycles - cpre;
+            per_q_cyc_pre[q].push_back(cpre);
+            per_q_cyc_post[q].push_back(cpost);
+            per_q_pre_exp[q].push_back(cpre > 0 ? static_cast<double>(r.expand_prefill) / cpre : NAN);
+            per_q_pre_br[q].push_back(cpre > 0 ? static_cast<double>(r.bridge_prefill) / cpre : NAN);
+            per_q_pre_fire[q].push_back(cpre > 0 ? static_cast<double>(r.fallback_prefill) / cpre : NAN);
+            per_q_post_exp[q].push_back(cpost > 0 ? static_cast<double>(r.expansion_size_sum - r.expand_prefill) / cpost : NAN);
+            per_q_post_br[q].push_back(cpost > 0 ? static_cast<double>(r.bridge_size_sum - r.bridge_prefill) / cpost : NAN);
+            per_q_post_fire[q].push_back(cpost > 0 ? static_cast<double>(r.fallback_count - r.fallback_prefill) / cpost : NAN);
+            per_q_stop_r[q].push_back(static_cast<double>(r.stop_radius));
+            per_q_stop_q[q].push_back(static_cast<double>(r.stop_queue_empty));
+            per_q_stop_b[q].push_back(static_cast<double>(r.stop_budget));
+            per_q_nfull[q].push_back(static_cast<double>(r.never_full));
+            per_q_prefill_ms[q].push_back(r.prefill_ms); // NaN when W never filled
+            per_q_fill_recall[q].push_back(compute_fill_recall(r, ground_truths[q], k));
+            per_q_fill_dist[q].push_back(r.never_full ? NAN : static_cast<double>(r.dist_prefill));
+            per_q_fill_pred[q].push_back(r.never_full ? NAN : static_cast<double>(r.pred_prefill));
+            per_q_desc[q].push_back(static_cast<double>(r.computed_distances - r.dist_base));
+            per_q_pre_dist[q].push_back(cpre > 0 ? static_cast<double>(r.dist_prefill) / cpre : NAN);
+            per_q_post_dist[q].push_back(cpost > 0 ? static_cast<double>(r.dist_base - r.dist_prefill) / cpost : NAN);
+            per_q_pre_pred[q].push_back(cpre > 0 ? static_cast<double>(r.pred_prefill) / cpre : NAN);
+            per_q_post_pred[q].push_back(cpost > 0 ? static_cast<double>(r.pred_base - r.pred_prefill) / cpost : NAN);
+            per_q_expand[q].push_back(cycles > 0 ? static_cast<double>(r.expansion_size_sum) / cycles : NAN);
+            per_q_bridge[q].push_back(cycles > 0 ? static_cast<double>(r.bridge_size_sum) / cycles : NAN);
+            per_q_bridge_sampled[q].push_back(cycles > 0 ? static_cast<double>(r.bridge_sampled_sum) / cycles : NAN);
+            per_q_promoted[q].push_back(cycles > 0 ? static_cast<double>(r.promoted_count) / cycles : NAN);
+            per_q_early_term[q].push_back(r.early_terminated ? 1.0 : 0.0);
             per_q_recall[q].push_back(r ? compute_recall(r, ground_truths[q], k) : 0.0);
         });
+        batch_qps.push_back(static_cast<double>(nq) / (batch_timer.elapsed_ms() / 1000.0));
     }
+    double med_qps = median(batch_qps);
 
     // For each query, compute its median across RUNS, then take median of those across queries
     std::vector<double> q_medians_ms(nq), q_medians_dist(nq), q_medians_visit(nq);
     std::vector<double> q_medians_recall(nq), q_medians_result(nq);
-    std::vector<double> q_medians_fb_count(nq), q_medians_fb_sel(nq);
-    std::vector<double> q_medians_pred_evals(nq);
+    std::vector<double> q_medians_pred_evals(nq), q_medians_fallback(nq), q_medians_early_term(nq);
+    std::vector<double> q_medians_expand(nq), q_medians_bridge(nq), q_medians_promoted(nq);
+    std::vector<double> q_medians_bridge_sampled(nq), q_medians_expand_cycles(nq), q_medians_expand_empty(nq);
+    std::vector<double> qm_cyc_pre(nq), qm_cyc_post(nq), qm_pre_exp(nq), qm_pre_br(nq), qm_pre_fire(nq),
+        qm_post_exp(nq), qm_post_br(nq), qm_post_fire(nq), qm_stop_r(nq), qm_stop_q(nq), qm_stop_b(nq), qm_nfull(nq),
+        qm_desc(nq), qm_pre_dist(nq), qm_post_dist(nq), qm_pre_pred(nq), qm_post_pred(nq), qm_prefill_ms(nq),
+        qm_fill_recall(nq), qm_fill_dist(nq), qm_fill_pred(nq);
     for (std::size_t q = 0; q < nq; ++q) {
         q_medians_ms[q] = median(per_q_ms[q]);
         q_medians_dist[q] = median(per_q_distances[q]);
         q_medians_visit[q] = median(per_q_visited[q]);
         q_medians_recall[q] = median(per_q_recall[q]);
         q_medians_result[q] = median(per_q_result_count[q]);
-        q_medians_fb_count[q] = median(per_q_fb_count[q]);
-        q_medians_fb_sel[q] = median(per_q_fb_selectivity[q]);
         q_medians_pred_evals[q] = median(per_q_pred_evals[q]);
+        q_medians_fallback[q] = median(per_q_fallback[q]);
+        q_medians_early_term[q] = median(per_q_early_term[q]);
+        q_medians_expand[q] = median(per_q_expand[q]);
+        q_medians_bridge[q] = median(per_q_bridge[q]);
+        q_medians_bridge_sampled[q] = median(per_q_bridge_sampled[q]);
+        q_medians_expand_cycles[q] = median(per_q_expand_cycles[q]);
+        q_medians_expand_empty[q] = median(per_q_expand_empty[q]);
+        qm_cyc_pre[q] = median(per_q_cyc_pre[q]);
+        qm_cyc_post[q] = median(per_q_cyc_post[q]);
+        qm_pre_exp[q] = median(per_q_pre_exp[q]);
+        qm_pre_br[q] = median(per_q_pre_br[q]);
+        qm_pre_fire[q] = median(per_q_pre_fire[q]);
+        qm_post_exp[q] = median(per_q_post_exp[q]);
+        qm_post_br[q] = median(per_q_post_br[q]);
+        qm_post_fire[q] = median(per_q_post_fire[q]);
+        qm_stop_r[q] = median(per_q_stop_r[q]);
+        qm_stop_q[q] = median(per_q_stop_q[q]);
+        qm_stop_b[q] = median(per_q_stop_b[q]);
+        qm_nfull[q] = median(per_q_nfull[q]);
+        qm_prefill_ms[q] = median(per_q_prefill_ms[q]);
+        qm_fill_recall[q] = median(per_q_fill_recall[q]);
+        qm_fill_dist[q] = median(per_q_fill_dist[q]);
+        qm_fill_pred[q] = median(per_q_fill_pred[q]);
+        qm_desc[q] = median(per_q_desc[q]);
+        qm_pre_dist[q] = median(per_q_pre_dist[q]);
+        qm_post_dist[q] = median(per_q_post_dist[q]);
+        qm_pre_pred[q] = median(per_q_pre_pred[q]);
+        qm_post_pred[q] = median(per_q_post_pred[q]);
+        q_medians_promoted[q] = median(per_q_promoted[q]);
     }
 
     double med_ms = median(q_medians_ms);
     double med_distances = median(q_medians_dist);
     double med_visited = median(q_medians_visit);
     double med_result_count = median(q_medians_result);
-    double med_fb_count = median(q_medians_fb_count);
-    double med_fb_selectivity = median(q_medians_fb_sel);
     double med_pred_evals = median(q_medians_pred_evals);
+    double med_fallback = median(q_medians_fallback);
+    // Mean, not median. The interesting figure is the share of queries that
+    // stopped early, and a median over 0/1 values would only ever read 0 or 1.
+    double early_term_rate = 0.0;
+    for (double e : q_medians_early_term)
+        early_term_rate += e;
+    early_term_rate /= static_cast<double>(q_medians_early_term.size());
+
+    // Latency percentiles across per-query medians (higher = slower).
+    std::vector<double> ms_sorted(q_medians_ms);
+    std::sort(ms_sorted.begin(), ms_sorted.end());
+    double p50_ms = percentile_sorted(ms_sorted, 0.50);
+    double p90_ms = percentile_sorted(ms_sorted, 0.90);
+    double p99_ms = percentile_sorted(ms_sorted, 0.99);
+
+    // Visit percentiles across per-query medians (higher = more cycles).
+    std::vector<double> visit_sorted(q_medians_visit);
+    std::sort(visit_sorted.begin(), visit_sorted.end());
+    double p01_visit = percentile_sorted(visit_sorted, 0.01);
+    double p10_visit = percentile_sorted(visit_sorted, 0.10);
+    double p50_visit = percentile_sorted(visit_sorted, 0.50);
+    double p90_visit = percentile_sorted(visit_sorted, 0.90);
+    double p99_visit = percentile_sorted(visit_sorted, 0.99);
+
+    // Expansion size across per-query means. NaN entries (queries that ran no
+    // ACORN cycle) are dropped rather than counted as 0. A row with no ACORN
+    // cycle at all reports 0 for every field.
+    auto summarize = [&](std::vector<double> const& per_query, double& mean, double& p10, double& p50, double& p90) {
+        std::vector<double> v;
+        v.reserve(per_query.size());
+        for (double x : per_query)
+            if (!std::isnan(x))
+                v.push_back(x);
+        if (v.empty()) {
+            mean = p10 = p50 = p90 = 0.0;
+            return;
+        }
+        double sum = 0.0;
+        for (double x : v)
+            sum += x;
+        mean = sum / static_cast<double>(v.size());
+        std::sort(v.begin(), v.end());
+        p10 = percentile_sorted(v, 0.10);
+        p50 = percentile_sorted(v, 0.50);
+        p90 = percentile_sorted(v, 0.90);
+    };
+    double expand_mean, expand_p10, expand_p50, expand_p90;
+    double bridge_mean, bridge_p10, bridge_p50, bridge_p90;
+    double promoted_mean, promoted_p10, promoted_p50, promoted_p90;
+    double bridge_sampled_mean, bs_p10, bs_p50, bs_p90;
+    summarize(q_medians_bridge_sampled, bridge_sampled_mean, bs_p10, bs_p50, bs_p90);
+    double med_expand_cycles = median(q_medians_expand_cycles);
+    double med_cyc_pre = median(qm_cyc_pre), med_cyc_post = median(qm_cyc_post);
+    double pre_exp_mean, pre_br_mean, post_exp_mean, post_br_mean, pre_fire, post_fire, d10, d50, d90;
+    summarize(qm_pre_exp, pre_exp_mean, d10, d50, d90);
+    summarize(qm_pre_br, pre_br_mean, d10, d50, d90);
+    summarize(qm_pre_fire, pre_fire, d10, d50, d90);
+    summarize(qm_post_exp, post_exp_mean, d10, d50, d90);
+    summarize(qm_post_br, post_br_mean, d10, d50, d90);
+    summarize(qm_post_fire, post_fire, d10, d50, d90);
+    double stop_r_rate, stop_q_rate, stop_b_rate, nfull_rate;
+    summarize(qm_stop_r, stop_r_rate, d10, d50, d90);
+    summarize(qm_stop_q, stop_q_rate, d10, d50, d90);
+    summarize(qm_stop_b, stop_b_rate, d10, d50, d90);
+    summarize(qm_nfull, nfull_rate, d10, d50, d90);
+    // Prefill time over the queries that actually reached `ef`. The rest are
+    // NaN and dropped; their share is `never_full_rate`.
+    // NaN, not 0: a cell where `W` never filled has an empty population, and 0 would
+    // read as "filled instantly". The JSON writer turns NaN into null.
+    double prefill_ms_mean = std::numeric_limits<double>::quiet_NaN(), prefill_ms_p50 = prefill_ms_mean,
+           prefill_ms_p90 = prefill_ms_mean, prefill_ms_p99 = prefill_ms_mean;
+    {
+        std::vector<double> v;
+        v.reserve(qm_prefill_ms.size());
+        for (double x : qm_prefill_ms)
+            if (!std::isnan(x))
+                v.push_back(x);
+        if (!v.empty()) {
+            double sum = 0.0;
+            for (double x : v)
+                sum += x;
+            prefill_ms_mean = sum / static_cast<double>(v.size());
+            std::sort(v.begin(), v.end());
+            prefill_ms_p50 = percentile_sorted(v, 0.50);
+            prefill_ms_p90 = percentile_sorted(v, 0.90);
+            prefill_ms_p99 = percentile_sorted(v, 0.99);
+        }
+    }
+    double med_desc = median(qm_desc);
+    double pre_dist_mean, post_dist_mean, pre_pred_mean, post_pred_mean;
+    summarize(qm_pre_dist, pre_dist_mean, d10, d50, d90);
+    summarize(qm_post_dist, post_dist_mean, d10, d50, d90);
+    summarize(qm_pre_pred, pre_pred_mean, d10, d50, d90);
+    summarize(qm_post_pred, post_pred_mean, d10, d50, d90);
+    double expand_empty_rate, ee_p10, ee_p50, ee_p90;
+    summarize(q_medians_expand_empty, expand_empty_rate, ee_p10, ee_p50, ee_p90);
+    (void)ee_p10;
+    (void)ee_p50;
+    (void)ee_p90;
+    (void)bs_p10;
+    (void)bs_p50;
+    (void)bs_p90;
+    summarize(q_medians_expand, expand_mean, expand_p10, expand_p50, expand_p90);
+    summarize(q_medians_bridge, bridge_mean, bridge_p10, bridge_p50, bridge_p90);
+    summarize(q_medians_promoted, promoted_mean, promoted_p10, promoted_p50, promoted_p90);
+    (void)promoted_p10;
+    (void)promoted_p50;
+    (void)promoted_p90;
 
     // Recall: compute avg and percentiles (sort once)
     double avg_recall = 0.0;
@@ -722,18 +1254,250 @@ search_result_summary_t run_search(index_t& index, metric_at& metric, std::vecto
     std::cout << "  Med nodes visited   : " << std::fixed << std::setprecision(0) << med_visited << "\n";
     std::cout << "  Med dist/visit      : " << std::fixed << std::setprecision(1)
               << (med_visited > 0 ? med_distances / med_visited : 0) << "\n";
-    if (med_fb_count > 0) {
-        std::cout << "  Med fallback count  : " << std::fixed << std::setprecision(1) << med_fb_count << "\n";
-        std::cout << "  Fallback selectivity: " << std::fixed << std::setprecision(4) << med_fb_selectivity << "\n";
-    }
     if (med_pred_evals > 0)
         std::cout << "  Med predicate evals : " << std::fixed << std::setprecision(0) << med_pred_evals << "\n";
-    bool fb_to_exact = any_fallback_to_exact.load(std::memory_order_relaxed);
-    if (fb_to_exact)
-        std::cout << "  ** Some queries switched to exact search (RACORN-1+) **\n";
+    if (early_ms >= 0.0)
+        std::cout << "  Early-terminated    : " << std::fixed << std::setprecision(1) << (early_term_rate * 100.0)
+                  << "% of queries (budget " << std::setprecision(3) << early_ms << " ms)\n";
 
-    return {label,      selectivity,    is_acorn,     is_exact,           med_ms,     med_distances, med_visited,
-            avg_recall, med_pred_evals, med_fb_count, med_fb_selectivity, fb_to_exact};
+    double recall_at_fill = std::numeric_limits<double>::quiet_NaN();
+    {
+        double sum = 0.0;
+        std::size_t n = 0;
+        for (double x : qm_fill_recall)
+            if (!std::isnan(x)) {
+                sum += x;
+                ++n;
+            }
+        if (n)
+            recall_at_fill = sum / static_cast<double>(n);
+    }
+    if (!std::isnan(recall_at_fill))
+        std::cout << "  Recall at fill      : avg=" << std::fixed << std::setprecision(4) << recall_at_fill
+                  << " (k best of W when it first held ef entries)\n";
+
+    search_result_summary_t out = {label,      mode,        selectivity,    is_exact ? std::size_t(0) : ef_search,
+            bridge_budget_ratio,     is_exact,
+            med_ms,     p50_ms,      p90_ms,         p99_ms,     med_qps,             med_distances,
+            med_visited,             p01_visit,      p10_visit,  p50_visit,  p90_visit, p99_visit,
+            avg_recall,              p50_recall,     p90_recall, p99_recall,
+            med_pred_evals,          med_fallback,
+            expand_mean,             expand_p10,     expand_p50, expand_p90,
+            bridge_mean,             bridge_p10,     bridge_p50, bridge_p90,
+            bridge_sampled_mean,     promoted_mean,  med_expand_cycles, expand_empty_rate,
+            med_cyc_pre,             med_cyc_post,
+            pre_exp_mean,            pre_br_mean,    pre_fire,
+            post_exp_mean,           post_br_mean,   post_fire,
+            stop_r_rate,             stop_q_rate,    stop_b_rate,    nfull_rate,
+            prefill_ms_mean,         prefill_ms_p50, prefill_ms_p90, prefill_ms_p99,
+            med_desc,                pre_dist_mean,  post_dist_mean, pre_pred_mean, post_pred_mean,
+            early_term_rate,         med_result_count,
+            st,         nq};
+    out.recall_at_fill = recall_at_fill;
+    out.prefill_dist_p50 = median(qm_fill_dist);
+    out.prefill_pred_p50 = median(qm_fill_pred);
+    return out;
+}
+
+// ── Prefilter (pre-filtering + exact scan) baseline ─────────────────────────
+// Models the classic pre-filtering strategy. The set of predicate-passing keys
+// is assumed to come from an attribute index, so it is collected once outside
+// the timed region. The timed portion is the exact top-k scan over that set.
+// Recall is 1.0 by construction (up to distance ties at the k-th boundary).
+// Latency is independent of ef_search, so there is one row per selectivity.
+template <typename metric_at>
+search_result_summary_t run_prefilter_search(metric_at& metric, std::vector<float const*> const& queries,
+                                             std::size_t k, std::size_t modulus, std::size_t pred_threshold,
+                                             char const* label, char const* mode, double selectivity,
+                                             std::vector<std::vector<vec_key_t>> const& ground_truths,
+                                             std::size_t ef_limit = 0, double early_ms = -1.0,
+                                             bool per_query_scan = false) {
+    using kernel_t = typename metric_at::kernel_t;
+    std::size_t const dims = metric.dimensions;
+    // The soft timeout for the exact scan mirrors the graph gate. The scan stops
+    // only once the budget is spent AND the heap holds `ef_limit` (= ef_search)
+    // candidates. So the returned top-k always comes from at least ef_search
+    // scanned matches. The clock is polled every 64 keys to keep it off the inner loop.
+    std::size_t const heap_cap = std::max(k, ef_limit);
+    bool const soft_timeout = early_ms >= 0.0 && ef_limit > 0;
+    std::chrono::duration<double, std::milli> const budget{early_ms};
+
+    // Passing-key list: one pass over the key space, outside the timed region.
+    // It is timed separately and reported as `passing_build_ms`; see the field comment.
+    // `per_query_scan` (mode prefilter-scan) rebuilds the list inside every query
+    // instead, so the attribute pass lands in the measured region. The shared list
+    // is then left empty and `passing_build_ms` reports -1.
+    stopwatch_t passing_timer;
+    std::vector<vec_key_t> passing;
+    double passing_build_ms = -1.0;
+    if (!per_query_scan) {
+        passing.reserve(static_cast<std::size_t>(static_cast<double>(N_VAL) * selectivity * 1.05) + 16);
+        for (std::size_t i = 0; i < N_VAL; ++i)
+            if (key_passes(i, modulus, pred_threshold, selectivity))
+                passing.push_back(static_cast<vec_key_t>(i));
+        passing_build_ms = passing_timer.elapsed_ms();
+    }
+    std::size_t const expected_passing =
+        per_query_scan ? static_cast<std::size_t>(static_cast<double>(N_VAL) * selectivity) : passing.size();
+
+    std::size_t nq = queries.size();
+    std::size_t st = std::min(SEARCH_THREADS, nq);
+    int WARMUP = static_cast<int>(BENCH_WARMUP);
+    int RUNS = static_cast<int>(BENCH_RUNS);
+
+    // Exact top-k over the passing set: max-heap of (distance, key), then
+    // ascending-by-distance key list for recall.
+    // Returns the top-k keys (ascending distance) and whether the soft timeout
+    // cut the scan short.
+    auto scan_one = [&](std::size_t q) {
+        using pair_t = std::pair<float, vec_key_t>;
+        std::vector<pair_t> heap;
+        heap.reserve(heap_cap + 1);
+        float const* query = queries[q];
+        bool terminated = false;
+        auto const started = std::chrono::steady_clock::now();
+        std::size_t scanned = 0;
+        // prefilter-scan: one pass over the attribute column per query, then the
+        // exact scan over what it collected. This is the cost a system pays when
+        // the predicate is not known ahead of the query.
+        std::vector<vec_key_t> local;
+        if (per_query_scan) {
+            local.reserve(static_cast<std::size_t>(static_cast<double>(N_VAL) * selectivity * 1.05) + 16);
+            for (std::size_t i = 0; i < N_VAL; ++i)
+                if (key_passes(i, modulus, pred_threshold, selectivity))
+                    local.push_back(static_cast<vec_key_t>(i));
+        }
+        std::vector<vec_key_t> const& scan_set = per_query_scan ? local : passing;
+        for (vec_key_t key : scan_set) {
+            float dist = kernel_t{}(query, metric.row(key), dims);
+            if (heap.size() < heap_cap) {
+                heap.emplace_back(dist, key);
+                std::push_heap(heap.begin(), heap.end());
+            } else if (dist < heap.front().first) {
+                std::pop_heap(heap.begin(), heap.end());
+                heap.back() = pair_t(dist, key);
+                std::push_heap(heap.begin(), heap.end());
+            }
+            if (soft_timeout && (++scanned & 63) == 0 && heap.size() >= ef_limit &&
+                std::chrono::steady_clock::now() - started >= budget) {
+                terminated = true;
+                break;
+            }
+        }
+        std::sort_heap(heap.begin(), heap.end());
+        std::vector<vec_key_t> keys;
+        keys.reserve(std::min(heap.size(), k));
+        for (std::size_t i = 0; i < heap.size() && i < k; ++i)
+            keys.push_back(heap[i].second);
+        return std::make_pair(std::move(keys), terminated);
+    };
+
+    query_pool_t pool(st, nq);
+    auto parallel_queries = [&](auto&& fn) { pool.run(std::forward<decltype(fn)>(fn)); };
+
+    for (int i = 0; i < WARMUP; ++i)
+        parallel_queries([&](std::size_t q, std::size_t) { (void)scan_one(q); });
+
+    std::vector<std::vector<double>> per_q_ms(nq);
+    std::vector<double> q_recall(nq, 0.0);
+    std::vector<double> q_early(nq, 0.0);
+    for (std::size_t q = 0; q < nq; ++q)
+        per_q_ms[q].reserve(RUNS);
+
+    std::vector<double> batch_qps;
+    batch_qps.reserve(RUNS);
+    for (int i = 0; i < RUNS; ++i) {
+        stopwatch_t batch_timer;
+        parallel_queries([&](std::size_t q, std::size_t) {
+            stopwatch_t t;
+            auto scanned = scan_one(q);
+            auto const& keys = scanned.first;
+            per_q_ms[q].push_back(t.elapsed_ms());
+            if (i == 0) {
+                q_early[q] = scanned.second ? 1.0 : 0.0;
+                auto const& gt = ground_truths[q];
+                std::size_t limit = std::min(gt.size(), k);
+                std::unordered_set<vec_key_t> gt_set(gt.begin(), gt.begin() + limit);
+                std::size_t hits = 0;
+                for (std::size_t r = 0; r < keys.size() && r < k; ++r)
+                    if (gt_set.count(keys[r]))
+                        ++hits;
+                q_recall[q] = limit > 0 ? static_cast<double>(hits) / static_cast<double>(limit) : 0.0;
+            }
+        });
+        batch_qps.push_back(static_cast<double>(nq) / (batch_timer.elapsed_ms() / 1000.0));
+    }
+    double med_qps = median(batch_qps);
+
+    std::vector<double> q_medians_ms(nq);
+    for (std::size_t q = 0; q < nq; ++q)
+        q_medians_ms[q] = median(per_q_ms[q]);
+    double med_ms = median(q_medians_ms);
+    std::vector<double> ms_sorted(q_medians_ms);
+    std::sort(ms_sorted.begin(), ms_sorted.end());
+    double p50_ms = percentile_sorted(ms_sorted, 0.50);
+    double p90_ms = percentile_sorted(ms_sorted, 0.90);
+    double p99_ms = percentile_sorted(ms_sorted, 0.99);
+
+    double avg_recall = 0.0;
+    for (double r : q_recall)
+        avg_recall += r;
+    avg_recall /= static_cast<double>(nq);
+    std::vector<double> recall_sorted(q_recall);
+    std::sort(recall_sorted.begin(), recall_sorted.end());
+    double p50_recall = percentile_sorted(recall_sorted, 0.50);
+    double p90_recall = percentile_sorted(recall_sorted, 0.10);
+    double p99_recall = percentile_sorted(recall_sorted, 0.01);
+
+    double results_returned = static_cast<double>(std::min<std::size_t>(k, expected_passing));
+    double early_term_rate = 0.0;
+    for (double e : q_early)
+        early_term_rate += e;
+    early_term_rate /= static_cast<double>(nq);
+
+    std::cout << "\n[" << label << "]\n";
+    std::cout << "  Queries             : " << nq << " x " << RUNS << " runs (" << WARMUP << " warmup, " << st
+              << " threads)\n";
+    std::cout << "  Passing keys        : " << passing.size() << " / " << N_VAL << "\n";
+    if (soft_timeout)
+        std::cout << "  Early-terminated    : " << std::fixed << std::setprecision(1) << (early_term_rate * 100.0)
+                  << "% of queries (budget " << std::setprecision(3) << early_ms << " ms, heap " << heap_cap << ")\n";
+    std::cout << "  Recall@" << k << std::string(13 - std::to_string(k).size(), ' ') << ": "
+              << "avg=" << std::fixed << std::setprecision(4) << avg_recall << "\n";
+    std::cout << "  Med latency         : " << std::fixed << std::setprecision(3) << med_ms << " ms\n";
+    std::cout << "  Distances per query : " << expected_passing << "\n";
+    if (per_query_scan)
+        std::cout << "  Passing-set build   : inside every query (prefilter-scan)\n";
+    else
+        std::cout << "  Passing-set build   : " << std::fixed << std::setprecision(3) << passing_build_ms
+                  << " ms (once per cell; " << std::setprecision(4) << passing_build_ms / static_cast<double>(nq)
+                  << " ms per query over " << nq << ")\n";
+
+    search_result_summary_t out = {label,      mode,       selectivity, std::size_t(0), 0.0,        false,
+            med_ms,     p50_ms,     p90_ms,      p99_ms,         med_qps,
+            static_cast<double>(expected_passing), static_cast<double>(expected_passing),
+            // Prefilter scans every passing node for every query, so the visit
+            // count has no per-query spread. The percentiles equal the mean.
+            static_cast<double>(expected_passing), static_cast<double>(expected_passing),
+            static_cast<double>(expected_passing), static_cast<double>(expected_passing),
+            static_cast<double>(expected_passing),
+            avg_recall, p50_recall, p90_recall,  p99_recall,     0.0,
+            0.0,
+            // Prefilter runs no ACORN cycle, so expansion accounting is empty.
+            0.0,        0.0,        0.0,         0.0,
+            0.0,        0.0,        0.0,         0.0,
+            0.0,        0.0,        0.0,        0.0,
+            // Prefilter runs no base-layer loop: no phase split, no stop reason.
+            0.0,        0.0,        0.0,         0.0,        0.0,
+            0.0,        0.0,        0.0,         0.0,        0.0,
+            0.0,        0.0,
+            // ... and no `W` to fill, so no prefill time either.
+            0.0,        0.0,        0.0,         0.0,
+            0.0,        0.0,        0.0,         0.0,        0.0,
+            early_term_rate,        results_returned,            st,
+            nq};
+    out.passing_build_ms = passing_build_ms;
+    return out;
 }
 
 // ── QPS search result ───────────────────────────────────────────────────────
@@ -741,35 +1505,34 @@ struct qps_result_t {
     double recall;
     double qps;
     double latency_ms;
+    // Share of queries that hit the soft time budget, sampled on the recall
+    // pass. Always 0 while --early-termination-ms is unset.
+    double early_term_rate;
 };
 
 // ── Run a single QPS measurement (all queries batched, median QPS) ──────────
-// `make_predicate(query_idx)` is invoked per query so cluster-correlation
-// mode can swap in a query-specific predicate. For modulo predicates the
-// caller's factory just returns the same fixed predicate object every call.
 template <typename metric_at, typename make_predicate_at>
 qps_result_t run_qps_search(index_t& index, metric_at& metric, std::vector<float const*> const& queries, std::size_t k,
-                            std::size_t ef_search, make_predicate_at&& make_predicate, double two_hop_threshold,
-                            bool racorn, double fallback_exact_threshold,
-                            std::vector<std::vector<vec_key_t>> const& ground_truths) {
+                            std::size_t ef_search, make_predicate_at&& make_predicate, double filter_first_threshold,
+                            double bridge_budget_ratio, std::vector<std::vector<vec_key_t>> const& ground_truths,
+                            std::size_t navix_heuristic = 0) {
 
     index_search_config_t cfg;
     cfg.expansion = ef_search;
-    cfg.two_hop_threshold = two_hop_threshold;
-    cfg.racorn = racorn;
-    cfg.bridge_budget_ratio = BRIDGE_BUDGET_RATIO;
-    cfg.three_hop_threshold = THREE_HOP_THRESHOLD;
-    cfg.fallback_exact_threshold = fallback_exact_threshold;
-    cfg.racorn_stride_sampling = RACORN_STRIDE_SAMPLING;
+    cfg.filter_first_threshold = filter_first_threshold;
+    cfg.bridge_budget_ratio = bridge_budget_ratio;
+    cfg.stride_sampling = STRIDE_SAMPLING;
+    cfg.navix_heuristic = navix_heuristic;
     cfg.exact = false;
+    cfg.early_termination_time_threshold = early_termination_threshold();
+    cfg.early_termination_min_results = ET_MIN_RESULTS;
 
     std::size_t nq = queries.size();
     std::size_t st = std::min(SEARCH_THREADS, nq);
 
-    // Persistent worker pool — spawned once per run_qps_search, reused across
-    // warmup, the recall pass, and all RUNS measurement batches. Critical for
-    // QPS mode where the timer wraps the whole batch and previously included
-    // per-iteration thread spawn/join cost.
+    // Persistent worker pool: spawned once per run_qps_search. It is reused across
+    // warmup, the recall pass, and all RUNS measurement batches, so the batch
+    // timer contains no thread spawn/join.
     query_pool_t pool(st, nq);
     auto parallel_queries = [&](auto&& fn) { pool.run(std::forward<decltype(fn)>(fn)); };
 
@@ -779,24 +1542,31 @@ qps_result_t run_qps_search(index_t& index, metric_at& metric, std::vector<float
             auto c = cfg;
             c.thread = tid;
             auto pred = make_predicate(q);
-            auto r = index.search(queries[q], k, metric, c, pred);
+            auto r = bench_search(index, queries[q], k, metric, c, pred);
             (void)r;
         });
     }
 
-    // Recall: single pass
+    // Recall: a single pass. It also serves as the early-termination sample,
+    // because the timed batches below must not pay for extra bookkeeping.
     std::vector<double> recalls(nq);
+    std::vector<double> early_terms(nq);
     parallel_queries([&](std::size_t q, std::size_t tid) {
         auto c = cfg;
         c.thread = tid;
         auto pred = make_predicate(q);
-        auto r = index.search(queries[q], k, metric, c, pred);
+        auto r = bench_search(index, queries[q], k, metric, c, pred);
         recalls[q] = r ? compute_recall(r, ground_truths[q], k) : 0.0;
+        early_terms[q] = r.early_terminated ? 1.0 : 0.0;
     });
     double avg_recall = 0.0;
     for (double r : recalls)
         avg_recall += r;
     avg_recall /= static_cast<double>(nq);
+    double early_term_rate = 0.0;
+    for (double e : early_terms)
+        early_term_rate += e;
+    early_term_rate /= static_cast<double>(nq);
 
     // QPS & latency: batch all queries, measure wall time, repeat BENCH_RUNS times
     std::vector<double> qps_values;
@@ -809,7 +1579,7 @@ qps_result_t run_qps_search(index_t& index, metric_at& metric, std::vector<float
             auto c = cfg;
             c.thread = tid;
             auto pred = make_predicate(q);
-            auto r = index.search(queries[q], k, metric, c, pred);
+            auto r = bench_search(index, queries[q], k, metric, c, pred);
             (void)r;
         });
         double elapsed_ms = timer.elapsed_ms();
@@ -820,7 +1590,7 @@ qps_result_t run_qps_search(index_t& index, metric_at& metric, std::vector<float
     double med_qps = median(qps_values);
     double med_latency = median(latency_values);
 
-    return {avg_recall, med_qps, med_latency};
+    return {avg_recall, med_qps, med_latency, early_term_rate};
 }
 
 // ── Compute exact ground truth for a given predicate ────────────────────────
@@ -830,7 +1600,7 @@ std::vector<vec_key_t> compute_ground_truth(index_t& index, metric_at& metric, f
     index_search_config_t exact_cfg;
     exact_cfg.exact = true;
     exact_cfg.thread = thread_id;
-    auto result = index.search(query, k, metric, exact_cfg, predicate);
+    auto result = bench_search(index, query, k, metric, exact_cfg, predicate);
     std::vector<vec_key_t> gt;
     gt.reserve(result.size());
     for (std::size_t i = 0; i < result.size(); ++i)
@@ -839,46 +1609,23 @@ std::vector<vec_key_t> compute_ground_truth(index_t& index, metric_at& metric, f
 }
 
 // ── Index volume file name ───────────────────────────────────────────────────
+// Pruning-free volumes carry a `_pf` suffix so both constructions coexist.
 static std::string index_volume_path() {
     std::ostringstream oss;
-    oss << VOLUME_DIR << "/" << DATASET_NAME << "_" << N << "_" << D << "_m" << M << "_ef" << EF_CONSTRUCTION
-        << ".usearch";
-    return oss.str();
-}
-
-// ── Cluster file paths ──────────────────────────────────────────────────────
-static std::string cluster_base_path() {
-    std::ostringstream oss;
-    oss << CLUSTER_DIR << "/cluster_" << DATASET_NAME << "_n" << N << "_k" << CLUSTER_K << ".bin";
-    return oss.str();
-}
-
-static std::string cluster_query_path() {
-    std::ostringstream oss;
-    // Query cluster IDs are tied to the base centroids learned at N vectors,
-    // so the filename must include N — otherwise builds of the same dataset
-    // at different N (e.g. text2image 1m vs 40m) would clobber each other's
-    // query files and the predicate would compare query/base cluster IDs
-    // from two different centroid spaces.
-    oss << CLUSTER_DIR << "/cluster_" << DATASET_NAME << "_query_n" << N << "_k" << CLUSTER_K << ".bin";
-    return oss.str();
-}
-
-// Suffix appended to GT filenames when running in cluster-correlation mode so
-// the file disambiguates from the modulo-based GT for the same (dataset, N, K, nq).
-static std::string cluster_gt_suffix() {
-    if (CLUSTER_CORRELATION == cluster_correlation_t::none)
-        return "";
-    std::ostringstream oss;
-    oss << "_cluster_" << (CLUSTER_CORRELATION == cluster_correlation_t::positive ? "pos" : "neg") << "_k" << CLUSTER_K;
+    oss << VOLUME_DIR << "/" << DATASET_NAME << "_" << N_VAL << "_" << D_VAL << "_m" << M_VAL << "_ef"
+        << EF_CONSTRUCTION_VAL << (PRUNING_FREE ? "_pf" : "") << ".usearch";
     return oss.str();
 }
 
 // ── Ground truth file name ───────────────────────────────────────────────────
+// {dataset}_{N}_{D}_m{M}_ef{EFC}{predicate_tag}_d{base fingerprint}_gt_k{k}_nq{nq}.bin
+// The fingerprint ties the cache to the base vectors it was computed from (see
+// file_fingerprint).
 static std::string gt_file_path(std::size_t gt_k, std::size_t nq) {
     std::ostringstream oss;
-    oss << GT_DIR << "/" << DATASET_NAME << "_" << N << "_" << D << "_m" << M << "_ef" << EF_CONSTRUCTION << "_gt_k"
-        << gt_k << "_nq" << nq << cluster_gt_suffix() << ".bin";
+    oss << GT_DIR << "/" << DATASET_NAME << "_" << N_VAL << "_" << D_VAL << "_m" << M_VAL << "_ef"
+        << EF_CONSTRUCTION_VAL << predicate_tag() << "_d" << BASE_FINGERPRINT << "_gt_k" << gt_k << "_nq" << nq
+        << ".bin";
     return oss.str();
 }
 
@@ -891,7 +1638,26 @@ static void parse_args(int argc, char** argv) {
                 std::cerr << "Missing value for " << arg << "\n";
                 std::exit(1);
             }
-            return static_cast<std::size_t>(std::stoull(argv[++i]));
+            char const* val = argv[++i];
+            try {
+                return static_cast<std::size_t>(std::stoull(val));
+            } catch (std::exception const&) {
+                std::cerr << "Invalid numeric value for " << arg << ": " << val << "\n";
+                std::exit(1);
+            }
+        };
+        auto next_double = [&]() -> double {
+            if (i + 1 >= argc) {
+                std::cerr << "Missing value for " << arg << "\n";
+                std::exit(1);
+            }
+            char const* val = argv[++i];
+            try {
+                return std::stod(val);
+            } catch (std::exception const&) {
+                std::cerr << "Invalid numeric value for " << arg << ": " << val << "\n";
+                std::exit(1);
+            }
         };
         if (arg == "--ef-search")
             EF_SEARCH_VAL = next_val();
@@ -910,8 +1676,8 @@ static void parse_args(int argc, char** argv) {
                 std::exit(1);
             }
             METRIC_NAME = argv[++i];
-            if (METRIC_NAME != "l2" && METRIC_NAME != "cosine") {
-                std::cerr << "Unknown metric: " << METRIC_NAME << " (use 'l2' or 'cosine')\n";
+            if (METRIC_NAME != "l2" && METRIC_NAME != "cosine" && METRIC_NAME != "ip") {
+                std::cerr << "Unknown metric: " << METRIC_NAME << " (use 'l2', 'cosine', or 'ip')\n";
                 std::exit(1);
             }
         } else if (arg == "--dataset") {
@@ -920,8 +1686,10 @@ static void parse_args(int argc, char** argv) {
                 std::exit(1);
             }
             DATASET_NAME = argv[++i];
-            if (DATASET_NAME != "sift" && DATASET_NAME != "gist" && DATASET_NAME != "text2image") {
-                std::cerr << "Unknown dataset: " << DATASET_NAME << " (use 'sift', 'gist', or 'text2image')\n";
+            if (DATASET_NAME != "sift" && DATASET_NAME != "gist" && DATASET_NAME != "text2image" &&
+                DATASET_NAME != "laion" && DATASET_NAME != "yfcc") {
+                std::cerr << "Unknown dataset: " << DATASET_NAME
+                          << " (use 'sift', 'gist', 'text2image', 'laion', or 'yfcc')\n";
                 std::exit(1);
             }
         } else if (arg == "--nq") {
@@ -934,90 +1702,223 @@ static void parse_args(int argc, char** argv) {
             if (SEARCH_THREADS == 0)
                 SEARCH_THREADS = 1;
             SEARCH_THREADS_SET = true;
-        } else if (arg == "--2hop-threshold") {
+        } else if (arg == "--filter-first-threshold") {
+            ACORN_THRESHOLD = next_double();
+        } else if (arg == "--cmpkey") {
+            USE_CMPKEY = true;
+        } else if (arg == "--stride") {
             if (i + 1 >= argc) {
-                std::cerr << "Missing value for --2hop-threshold\n";
+                std::cerr << "Missing value for --stride (use 'on' or 'off')\n";
                 std::exit(1);
             }
-            ACORN_THRESHOLD = std::stod(argv[++i]);
+            std::string v = argv[++i];
+            if (iequals(v, "on"))
+                STRIDE_SAMPLING = true;
+            else if (iequals(v, "off"))
+                STRIDE_SAMPLING = false;
+            else {
+                std::cerr << "Invalid --stride value: " << v << " (use 'on' or 'off')\n";
+                std::exit(1);
+            }
         } else if (arg == "--bridge-budget-ratio") {
-            if (i + 1 >= argc) {
-                std::cerr << "Missing value for --bridge-budget-ratio\n";
-                std::exit(1);
-            }
-            BRIDGE_BUDGET_RATIO = std::stod(argv[++i]);
+            // RACORN-1 bridge budget ratio (used by the racorn-1 mode).
+            BRIDGE_BUDGET_RATIO = next_double();
             if (BRIDGE_BUDGET_RATIO < 0.0) {
                 std::cerr << "--bridge-budget-ratio must be >= 0\n";
                 std::exit(1);
             }
-        } else if (arg == "--fallback-threshold") {
+        } else if (arg == "--bridge-budget-ratios") {
+            // Sweep list for the racorn-1 mode: one RACORN-1 row per ratio.
             if (i + 1 >= argc) {
-                std::cerr << "Missing value for --fallback-threshold\n";
+                std::cerr << "Missing value for --bridge-budget-ratios\n";
                 std::exit(1);
             }
-            FALLBACK_EXACT_THRESHOLD = std::stod(argv[++i]);
-            if (FALLBACK_EXACT_THRESHOLD < 0.0) {
-                std::cerr << "--fallback-threshold must be >= 0\n";
+            std::string list = argv[++i];
+            BBR_VALUES.clear();
+            std::istringstream ss(list);
+            std::string token;
+            while (std::getline(ss, token, ',')) {
+                if (token.empty())
+                    continue;
+                double v = 0.0;
+                try {
+                    v = std::stod(token);
+                } catch (std::exception const&) {
+                    std::cerr << "Invalid bridge budget ratio: " << token << "\n";
+                    std::exit(1);
+                }
+                if (v < 0.0) {
+                    std::cerr << "--bridge-budget-ratios values must be >= 0\n";
+                    std::exit(1);
+                }
+                BBR_VALUES.push_back(v);
+            }
+            if (BBR_VALUES.empty()) {
+                std::cerr << "No valid values in --bridge-budget-ratios: " << list << "\n";
                 std::exit(1);
             }
-        } else if (arg == "--cluster-correlation") {
+        } else if (arg == "--recall-target") {
+            // Stop a latency-mode ef sweep for a (selectivity, mode, br) series
+            // once avg recall reaches this value. Only meaningful with --ef-values.
+            RECALL_TARGET = next_double();
+        } else if (arg == "--build-threads") {
+            BUILD_THREADS = next_val();
+        } else if (arg == "--three-hop-threshold") {
+            // acorn-1-3hop trigger: a third hop when the 2-hop passing candidates < connectivity_base x tau.
+            THREE_HOP_TAU = next_double();
+            if (THREE_HOP_TAU < 0.0) {
+                std::cerr << "--three-hop-threshold must be >= 0\n";
+                std::exit(1);
+            }
+        } else if (arg == "--predicate") {
             if (i + 1 >= argc) {
-                std::cerr << "Missing value for --cluster-correlation (none|positive|negative)\n";
+                std::cerr << "Missing value for --predicate\n";
                 std::exit(1);
             }
-            std::string v = argv[++i];
-            if (iequals(v, "none")) CLUSTER_CORRELATION = cluster_correlation_t::none;
-            else if (iequals(v, "positive") || iequals(v, "pos")) CLUSTER_CORRELATION = cluster_correlation_t::positive;
-            else if (iequals(v, "negative") || iequals(v, "neg")) CLUSTER_CORRELATION = cluster_correlation_t::negative;
-            else {
-                std::cerr << "--cluster-correlation expects none|positive|negative (got: " << v << ")\n";
+            PREDICATE_KIND = argv[++i];
+            if (PREDICATE_KIND != "modulo" && PREDICATE_KIND != "random") {
+                std::cerr << "Unknown predicate: " << PREDICATE_KIND << " (use 'modulo' or 'random')\n";
                 std::exit(1);
             }
-        } else if (arg == "--cluster-k") {
-            CLUSTER_K = next_val();
-            if (CLUSTER_K == 0) {
-                std::cerr << "--cluster-k must be > 0\n";
-                std::exit(1);
-            }
-        } else if (arg == "--cluster-dir") {
+        } else if (arg == "--seed") {
+            PREDICATE_SEED = static_cast<std::uint64_t>(next_val());
+        } else if (arg == "--pruning-free") {
+            // ACORN-paper-spec construction (Section 5.3): skip the RNG pruning
+            // heuristic and keep the nearest candidates. Applies to --build-index
+            // and selects the `_pf` volume in the benchmark modes.
+            PRUNING_FREE = true;
+        } else if (arg == "--early-termination-fractions" || arg == "--early-termination-ms-values") {
+            // Soft-timeout ladder for the latency mode (see ET_FRACTIONS/ET_MS_VALUES).
+            bool const fractions = arg == "--early-termination-fractions";
             if (i + 1 >= argc) {
-                std::cerr << "Missing value for --cluster-dir\n";
+                std::cerr << "Missing value for " << arg << "\n";
                 std::exit(1);
             }
-            CLUSTER_DIR = argv[++i];
-        } else if (arg == "--racorn-stride-sampling") {
+            std::string list = argv[++i];
+            std::vector<double>& dst = fractions ? ET_FRACTIONS : ET_MS_VALUES;
+            dst.clear();
+            std::istringstream ss(list);
+            std::string token;
+            while (std::getline(ss, token, ',')) {
+                if (token.empty())
+                    continue;
+                double v = 0.0;
+                try {
+                    v = std::stod(token);
+                } catch (std::exception const&) {
+                    std::cerr << "Invalid value for " << arg << ": " << token << "\n";
+                    std::exit(1);
+                }
+                if (v < 0.0 || (fractions && v > 1.0)) {
+                    std::cerr << arg << " values must be " << (fractions ? "within [0, 1]" : ">= 0") << "\n";
+                    std::exit(1);
+                }
+                dst.push_back(v);
+            }
+            if (dst.empty()) {
+                std::cerr << "No valid values in " << arg << ": " << list << "\n";
+                std::exit(1);
+            }
+        } else if (arg == "--early-termination-ms") {
+            // Soft base-layer time budget; negative disables it.
+            EARLY_TERMINATION_MS = next_double();
+        } else if (arg == "--et-min-results") {
+            // Heap fill the budget waits for (0 = ef_search; k = budget-only stopping).
+            ET_MIN_RESULTS = next_val();
+        } else if (arg == "--et-skip-unbudgeted") {
+            ET_SKIP_UNBUDGETED = true;
+        } else if (arg == "--et-anchor") {
+            // <mode>@<ef>:<f1,f2,...> — see ET_ANCHORS.
             if (i + 1 >= argc) {
-                std::cerr << "Missing value for --racorn-stride-sampling (on|off)\n";
+                std::cerr << "Missing value for --et-anchor\n";
                 std::exit(1);
             }
-            std::string v = argv[++i];
-            if (iequals(v, "on") || iequals(v, "true") || v == "1") {
-                RACORN_STRIDE_SAMPLING = true;
-            } else if (iequals(v, "off") || iequals(v, "false") || v == "0") {
-                RACORN_STRIDE_SAMPLING = false;
-            } else {
-                std::cerr << "--racorn-stride-sampling expects on/off (got: " << v << ")\n";
+            std::string const spec = argv[++i];
+            std::size_t const at = spec.find('@');
+            std::size_t const colon = at == std::string::npos ? std::string::npos : spec.find(':', at);
+            if (at == std::string::npos || at == 0 || colon == std::string::npos || colon <= at + 1 ||
+                colon + 1 >= spec.size()) {
+                std::cerr << "--et-anchor expects <mode>@<ef>:<fractions>, got: " << spec << "\n";
                 std::exit(1);
             }
-        } else if (arg == "--3hop-threshold") {
+            et_anchor_t a;
+            a.mode = spec.substr(0, at);
+            a.name = spec.substr(0, colon);
+            try {
+                a.ef = static_cast<std::size_t>(std::stoul(spec.substr(at + 1, colon - at - 1)));
+            } catch (std::exception const&) {
+                std::cerr << "--et-anchor: invalid ef in " << spec << "\n";
+                std::exit(1);
+            }
+            std::istringstream ss(spec.substr(colon + 1));
+            std::string token;
+            while (std::getline(ss, token, ',')) {
+                if (token.empty())
+                    continue;
+                double v = 0.0;
+                try {
+                    v = std::stod(token);
+                } catch (std::exception const&) {
+                    std::cerr << "--et-anchor: invalid fraction " << token << " in " << spec << "\n";
+                    std::exit(1);
+                }
+                if (!(v > 0.0)) {
+                    std::cerr << "--et-anchor fractions must be > 0: " << spec << "\n";
+                    std::exit(1);
+                }
+                a.fractions.push_back(v);
+            }
+            if (a.fractions.empty()) {
+                std::cerr << "--et-anchor: no fractions in " << spec << "\n";
+                std::exit(1);
+            }
+            ET_ANCHORS.push_back(a);
+        } else if (arg == "--mode-ef") {
+            // <mode>:<ef1,ef2,...> — see MODE_EF.
             if (i + 1 >= argc) {
-                std::cerr << "Missing value for --3hop-threshold\n";
+                std::cerr << "Missing value for --mode-ef\n";
                 std::exit(1);
             }
-            THREE_HOP_THRESHOLD = std::stod(argv[++i]);
-#if !USEARCH_ENABLE_3HOP
-            if (THREE_HOP_THRESHOLD >= 0) {
-                std::cerr << "Warning: --3hop-threshold=" << THREE_HOP_THRESHOLD
-                          << " ignored — this binary was built without USEARCH_ENABLE_3HOP=1.\n"
-                          << "         Use `bench_acorn_3hop` to enable 3-hop expansion.\n";
+            std::string const spec = argv[++i];
+            std::size_t const colon = spec.find(':');
+            if (colon == std::string::npos || colon == 0 || colon + 1 >= spec.size()) {
+                std::cerr << "--mode-ef expects <mode>:<ef list>, got: " << spec << "\n";
+                std::exit(1);
             }
-#endif
+            std::vector<std::size_t> efs;
+            std::istringstream ss(spec.substr(colon + 1));
+            std::string token;
+            while (std::getline(ss, token, ',')) {
+                if (token.empty())
+                    continue;
+                try {
+                    efs.push_back(static_cast<std::size_t>(std::stoul(token)));
+                } catch (std::exception const&) {
+                    std::cerr << "--mode-ef: invalid ef " << token << " in " << spec << "\n";
+                    std::exit(1);
+                }
+                if (efs.back() == 0) {
+                    std::cerr << "--mode-ef: ef must be > 0: " << spec << "\n";
+                    std::exit(1);
+                }
+            }
+            if (efs.empty()) {
+                std::cerr << "--mode-ef: no ef values in " << spec << "\n";
+                std::exit(1);
+            }
+            MODE_EF.emplace_back(spec.substr(0, colon), efs);
         } else if (arg == "--runs") {
             BENCH_RUNS = next_val();
             if (BENCH_RUNS == 0)
                 BENCH_RUNS = 1;
         } else if (arg == "--warmup") {
             BENCH_WARMUP = next_val();
+        } else if (arg == "--json") {
+            if (i + 1 >= argc) {
+                std::cerr << "Missing value for --json\n";
+                std::exit(1);
+            }
+            JSON_PATH = argv[++i];
         } else if (arg == "--selectivity") {
             if (i + 1 >= argc) {
                 std::cerr << "Missing value for --selectivity\n";
@@ -1031,10 +1932,15 @@ static void parse_args(int argc, char** argv) {
                 if (token.empty())
                     continue;
                 double val = 0.0;
-                if (token.back() == '%')
-                    val = std::stod(token.substr(0, token.size() - 1)) / 100.0;
-                else
-                    val = std::stod(token);
+                try {
+                    if (token.back() == '%')
+                        val = std::stod(token.substr(0, token.size() - 1)) / 100.0;
+                    else
+                        val = std::stod(token);
+                } catch (std::exception const&) {
+                    std::cerr << "Invalid selectivity value: " << token << "\n";
+                    std::exit(1);
+                }
                 FILTER_SELECTIVITIES.push_back(val);
             }
             if (FILTER_SELECTIVITIES.empty()) {
@@ -1075,13 +1981,19 @@ static void parse_args(int argc, char** argv) {
                 std::exit(1);
             }
             std::string ef_list = argv[++i];
+            EF_VALUES_SET = true;
             QPS_EF_VALUES.clear();
             std::istringstream ss(ef_list);
             std::string token;
             while (std::getline(ss, token, ',')) {
                 if (token.empty())
                     continue;
-                QPS_EF_VALUES.push_back(static_cast<std::size_t>(std::stoull(token)));
+                try {
+                    QPS_EF_VALUES.push_back(static_cast<std::size_t>(std::stoull(token)));
+                } catch (std::exception const&) {
+                    std::cerr << "Invalid ef_search value: " << token << "\n";
+                    std::exit(1);
+                }
             }
             if (QPS_EF_VALUES.empty()) {
                 std::cerr << "No valid ef_search values in: " << ef_list << "\n";
@@ -1098,7 +2010,9 @@ static void parse_args(int argc, char** argv) {
             FILTER_MODES.clear();
             std::istringstream ss(mode_list);
             std::string token;
-            static char const* const valid[] = {"exact", "hnsw", "acorn-1", "racorn-1", "racorn-1+"};
+            static char const* const valid[] = {"exact",          "prefilter",   "prefilter-scan", "hnsw",
+                                                "acorn-1",        "acorn-1-3hop", "racorn-1",   "navix-onehop-s",
+                                                "navix-blind",    "navix-directed", "navix-local",  "navix-local-paper"};
             while (std::getline(ss, token, ',')) {
                 if (token.empty())
                     continue;
@@ -1109,7 +2023,9 @@ static void parse_args(int argc, char** argv) {
                         break;
                     }
                 if (!ok) {
-                    std::cerr << "Unknown mode: " << token << " (valid: exact, hnsw, acorn-1, racorn-1, racorn-1+)\n";
+                    std::cerr << "Unknown mode: " << token
+                              << " (valid: exact, prefilter, prefilter-scan, hnsw, acorn-1, acorn-1-3hop, racorn-1, "
+                                 "navix-onehop-s, navix-blind, navix-directed, navix-local, navix-local-paper)\n";
                     std::exit(1);
                 }
                 FILTER_MODES.push_back(token);
@@ -1119,113 +2035,139 @@ static void parse_args(int argc, char** argv) {
                 std::exit(1);
             }
         } else if (arg == "--help" || arg == "-h") {
-            std::cout << "Usage: bench_acorn [options]\n"
-                      << "\n"
-                      << "Modes (mutually exclusive; default = latency benchmark):\n"
-                      << "  (default)             Latency benchmark (Exact/HNSW/ACORN-1/RACORN-1 per selectivity).\n"
-                      << "  --build-index         Build the index volume and exit. No queries are run.\n"
-                      << "  --build-gt            Build ground-truth file for queries. Requires existing volume.\n"
-                      << "  --qps                 QPS benchmark: sweep ef_search values, report recall/QPS/latency.\n"
-                      << "\n"
-                      << "Notes:\n"
-                      << "  - GT files saved by --build-gt are auto-loaded by latency/qps modes when their\n"
-                      << "    header is compatible (file_nq >= bench nq, file_gt_k >= K, magic 'GT01').\n"
-                      << "  - Two binaries are produced: `bench_acorn` (default) and `bench_acorn_3hop`\n"
-                      << "    (compiled with USEARCH_ENABLE_3HOP=1). Only the 3hop binary actually runs the\n"
-                      << "    3-hop expansion code path; `--3hop-threshold` is parsed but ignored otherwise.\n"
-                      << "\n"
-                      << "── Common options (all modes) ──────────────────────────────────────\n"
-                      << "  --dataset <name>      Dataset: sift, gist, text2image (default: sift)\n"
-                      << "  --n <N>               Number of vectors to index (default: 1000000)\n"
-                      << "                        sift max: " << SIFT_N_MAX << ", gist max: " << GIST_N_MAX
-                      << ", text2image max: " << TEXT2IMAGE_N_MAX << "\n"
-                      << "  --m <N>               Graph connectivity M (default: 16)\n"
-                      << "  --ef-construction <N> EF construction expansion (default: 100)\n"
-                      << "  --k <N>               Top-K results (default: 100)\n"
-                      << "  --metric <name>       Distance metric: l2, cosine\n"
-                      << "                        (default: l2 for sift/gist, cosine for text2image)\n"
-                      << "  --nq <N>              Number of query vectors to use (default: 100)\n"
-                      << "                        sift max: 10000, gist max: 1000, text2image max: 100000\n"
-                      << "  --search-threads <N>  Parallel search threads (default: 1; --build-gt\n"
-                      << "                        defaults to hardware_concurrency when unset)\n"
-                      << "  --data-dir <path>     Directory for raw dataset files (default: data/raw)\n"
-                      << "  --volume-dir <path>   Directory for index volume files (default: data/volumes)\n"
-                      << "  --gt-dir <path>       Directory for ground truth files (default: data/gt)\n"
-                      << "  --selectivity <list>  Comma-separated selectivity values to filter test cases\n"
-                      << "                        e.g. --selectivity 10%,1%,0.1% or --selectivity 0.10,0.01\n"
-                      << "                        Applies to --build-gt, latency, and --qps modes.\n"
-                      << "                        Ignored by --build-index. In latency mode, also enables\n"
-                      << "                        per-query recall breakdown (avg, p50, p95, p99).\n"
-                      << "\n"
-                      << "── Volume build mode (--build-index) ───────────────────────────────\n"
-                      << "  Uses --m / --ef-construction to control build quality. --nq, --selectivity,\n"
-                      << "  and all benchmark-only flags are ignored. Existing volume is overwritten.\n"
-                      << "\n"
-                      << "── Ground truth build mode (--build-gt) ────────────────────────────\n"
-                      << "  --build-gt-k <N>      GT results per query (default: same as --k)\n"
-                      << "  --nq <N>              Use this many queries for GT (default: dataset q_max\n"
-                      << "                        when --nq is not specified). Smaller --nq → smaller GT.\n"
-                      << "  --selectivity <list>  Build only the listed selectivities (default: all 21).\n"
-                      << "\n"
-                      << "── Latency benchmark mode (default) ────────────────────────────────\n"
-                      << "  --ef-search <N>           EF search expansion (default: 200)\n"
-                      << "  --2hop-threshold <F>      ACORN-1 two-hop expansion threshold (default: 0.3)\n"
-                      << "  --bridge-budget-ratio <F> RACORN-1 bridge budget ratio (default: 1.0)\n"
-                      << "  --fallback-threshold <F>  RACORN-1+ exact-fallback threshold (default: 0.003).\n"
-                      << "                            Set to 0 to disable RACORN-1+ (degenerates to RACORN-1).\n"
-                      << "  --3hop-threshold <F>      3-hop expansion threshold (default: -1, disabled).\n"
-                      << "                            Mutually exclusive with racorn.\n"
-                      << "                            Effective only in `bench_acorn_3hop` binary.\n"
-                      << "  --racorn-stride-sampling <s>  RACORN-1 stride sampling (default: on; off disables\n"
-                      << "                            stride down-sampling at both call sites). RACORN-1\n"
-                      << "                            ablation tool — see run_racorn1_ablation.sh.\n"
-                      << "  --runs <N>                Measurement runs per query (default: 10)\n"
-                      << "  --warmup <N>              Warmup runs before measurement (default: 3)\n"
-                      << "  --skip-exact              Skip exact search latency benchmark.\n"
-                      << "                            (GT for recall is still computed/loaded.)\n"
-                      << "  --modes <list>            Comma-separated modes to run.\n"
-                      << "                            Valid: exact, hnsw, acorn-1, racorn-1, racorn-1+.\n"
-                      << "                            e.g. --modes hnsw,acorn-1 or --modes acorn-1\n"
-                      << "                            Baseline (no-predicate) row skipped when set.\n"
-                      << "                            Speedup/Recall/Dist ratios shown only when HNSW is included.\n"
-                      << "\n"
-                      << "── QPS benchmark mode (--qps) ──────────────────────────────────────\n"
-                      << "  --ef-values <list>        Comma-separated ef_search values to sweep\n"
-                      << "                            (default: 128,256,384,512). Replaces --ef-search.\n"
-                      << "  --2hop-threshold <F>      ACORN-1 two-hop expansion threshold (default: 0.3)\n"
-                      << "  --bridge-budget-ratio <F> RACORN-1 bridge budget ratio (default: 1.0)\n"
-                      << "  --3hop-threshold <F>      3-hop expansion threshold (default: -1).\n"
-                      << "                            Effective only in `bench_acorn_3hop` binary.\n"
-                      << "  --runs <N>                Measurement runs per configuration (default: 10)\n"
-                      << "                            Each run = full nq batch; reported QPS/latency are medians.\n"
-                      << "  --warmup <N>              Warmup runs (default: 3)\n"
-                      << "  --modes <list>            Comma-separated modes to run.\n"
-                      << "                            Valid: hnsw, acorn-1, racorn-1.\n"
-                      << "                            'exact' is rejected — QPS mode never runs exact search.\n"
-                      << "  --skip-exact has no effect (already implied).\n"
-                      << "\n"
-                      << "── Cluster correlation mode (overrides modulo cases) ───────────────\n"
-                      << "  --cluster-correlation <s> Filter mode: none|positive|negative.\n"
-                      << "                            positive: target = query.cluster_id\n"
-                      << "                              → node.cluster_id == query.cluster_id\n"
-                      << "                              (selectivity ~1/K, query-correlated).\n"
-                      << "                            negative: target = a random non-self cluster id picked\n"
-                      << "                              once per query (deterministic seed)\n"
-                      << "                              → node.cluster_id == target\n"
-                      << "                              (selectivity ~1/K, uncorrelated with the query).\n"
-                      << "                            Replaces all 21 modulo cases with one cluster case.\n"
-                      << "  --cluster-k <N>           K used for the cluster files (default: 100).\n"
-                      << "                            Cluster files are produced by\n"
-                      << "                            cpp/scripts/build_clusters.py. K >= 2 required for\n"
-                      << "                            negative correlation.\n"
-                      << "  --cluster-dir <path>      Cluster file directory (default: data/clusters).\n"
-                      << "                            File pattern: cluster_<dataset>_n<N>_k<K>.bin and\n"
-                      << "                            cluster_<dataset>_query_n<N>_k<K>.bin.\n"
-                      << "  GT files for cluster mode are suffixed with `_cluster_pos_kK` /\n"
-                      << "  `_cluster_neg_kK`, so they don't collide with modulo GT files.\n"
-                      << "  Note: negative-mode semantics changed (now random non-self target,\n"
-                      << "  was previously `!=`). Existing `_cluster_neg_kK` GT files must be\n"
-                      << "  rebuilt with --build-gt before running benches.\n";
+            std::cout
+                << "Usage: bench_acorn [options]\n"
+                << "\n"
+                << "Modes (mutually exclusive; default = latency benchmark):\n"
+                << "  (default)             Latency benchmark: the modes of --modes at every selectivity.\n"
+                << "  --build-index         Build the index volume and exit. No queries are run.\n"
+                << "  --build-gt            Build ground-truth file for queries. Requires existing volume.\n"
+                << "  --qps                 QPS benchmark: sweep ef_search values, report recall/QPS/latency.\n"
+                << "\n"
+                << "Notes:\n"
+                << "  - GT files saved by --build-gt are auto-loaded by latency/qps modes when their\n"
+                << "    header is compatible (file_nq >= bench nq, file_gt_k >= K, magic 'GT01').\n"
+                << "\n"
+                << "-- Common options (all modes) --------------------------------------\n"
+                << "  --dataset <name>      Dataset: sift, gist, text2image, laion, yfcc (default: sift)\n"
+                << "  --n <N>               Number of vectors to index (default: 1000000)\n"
+                << "                        sift max: " << SIFT_N_MAX << ", gist max: " << GIST_N_MAX
+                << ", text2image max: " << TEXT2IMAGE_N_MAX << ", laion max: " << LAION_N_MAX
+                << ", yfcc max: " << YFCC_N_MAX << "\n"
+                << "  --m <N>               Graph connectivity M (default: 16)\n"
+                << "  --ef-construction <N> EF construction expansion (default: 100)\n"
+                << "  --k <N>               Top-K results (default: 100)\n"
+                << "  --metric <name>       Distance metric: l2, cosine, ip (default: per dataset)\n"
+                << "                        cosine L2-normalizes base+query; ip uses raw magnitudes.\n"
+                << "                        NOTE: volume/GT filenames do NOT encode the metric --\n"
+                << "                        use a separate --volume-dir/--gt-dir per metric.\n"
+                << "                        (default: l2 for sift, gist and yfcc; cosine for text2image and laion)\n"
+                << "  --nq <N>              Number of query vectors to use (default: 100)\n"
+                << "                        sift max: 10000, gist and laion max: 1000, text2image and yfcc max: 100000\n"
+                << "  --search-threads <N>  Parallel search threads (default: 1; --build-gt\n"
+                << "                        defaults to hardware_concurrency when unset)\n"
+                << "  --data-dir <path>     Directory for raw dataset files (default: data/raw)\n"
+                << "  --volume-dir <path>   Directory for index volume files (default: data/volumes)\n"
+                << "  --gt-dir <path>       Directory for ground truth files (default: data/gt)\n"
+                << "  --selectivity <list>  Comma-separated selectivity values to filter test cases\n"
+                << "                        e.g. --selectivity 10%,1%,0.1% or --selectivity 0.10,0.01\n"
+                << "                        Applies to --build-gt, latency, and --qps modes.\n"
+                << "                        Ignored by --build-index.\n"
+                << "  --help, -h            This text\n"
+                << "\n"
+                << "-- Predicate (--build-gt, latency and --qps modes) -----------------\n"
+                << "  --predicate <kind>    Control predicate: modulo (default, key % m < t) or random\n"
+                << "                        (seed-fixed uniform uint32 attribute per key, pass when\n"
+                << "                        attr < selectivity*2^32). GT files get a _rnd<seed> tag.\n"
+                << "  --seed <N>            Seed for --predicate random (default 12345).\n"
+                << "\n"
+                << "-- Volume build mode (--build-index) -------------------------------\n"
+                << "  Uses --m / --ef-construction to control build quality. --nq, --selectivity,\n"
+                << "  and all benchmark-only flags are ignored. Existing volume is overwritten.\n"
+                << "  --build-threads <N>   Indexing threads (default: hardware_concurrency).\n"
+                << "  --pruning-free        Skip the RNG pruning heuristic (ACORN paper Sec. 5.3\n"
+                << "                        construction). Volume gets a `_pf` suffix; pass the\n"
+                << "                        same flag to benchmark modes to load that volume.\n"
+                << "\n"
+                << "-- Ground truth build mode (--build-gt) ----------------------------\n"
+                << "  --build-gt-k <N>      GT results per query (default: same as --k)\n"
+                << "  --nq <N>              Use this many queries for GT (default: dataset q_max\n"
+                << "                        when --nq is not specified). Smaller --nq -> smaller GT.\n"
+                << "  --selectivity <list>  Build only the listed selectivities (default: all 25).\n"
+                << "\n"
+                << "-- Latency benchmark mode (default) --------------------------------\n"
+                << "  --ef-search <N>           EF search expansion (default: 200)\n"
+                << "  --ef-values <list>        Sweep ef_search over these values (one row per ef).\n"
+                << "                            Replaces --ef-search; combine with --recall-target\n"
+                << "                            to stop each (selectivity, mode, br) series early.\n"
+                << "  --recall-target <F>       With --ef-values: stop a series once avg recall >= F.\n"
+                << "  --bridge-budget-ratios <list>  Run racorn-1 once per ratio (e.g. 1.0,1.5,2.0).\n"
+                << "  --early-termination-fractions <list>  Soft-timeout ladder: each series first runs\n"
+                << "                            without a budget, then once per fraction of its own\n"
+                << "                            unlimited p50 (e.g. 0,0.1,0.25,0.5,0.75,0.9). Also applies\n"
+                << "                            to prefilter (exact scan stops once ef_search matches are\n"
+                << "                            held and the budget is spent). Rows carry early_termination_ms.\n"
+                << "  --early-termination-ms-values <list>  Absolute soft-timeout ladder (ms), same semantics.\n"
+                << "  --et-skip-unbudgeted      With --early-termination-ms-values, skip each series' unbudgeted row.\n"
+                << "  --et-min-results <N>      Heap fill the soft budget waits for before it may stop a search\n"
+                << "                            (default 0 = ef_search). N = k makes the budget the only stopping\n"
+                << "                            rule beyond k results (iso-latency mode).\n"
+                << "  --et-anchor <mode>@<ef>:<fractions>  Budgets = fractions x that series' prefill p50 measured\n"
+                << "                            in this process (the time its W first held ef results), applied\n"
+                << "                            to every graph series of the same selectivity. Repeatable;\n"
+                << "                            fractions may exceed 1. Rows carry et_anchor / et_fraction.\n"
+                << "  --mode-ef <mode>:<list>   ef sweep for one mode only (overrides --ef-values / --ef-search for it). Repeatable.\n"
+                << "  --filter-first-threshold <F>      Filter-first threshold (probe ratio at entry) (default: 0.3)\n"
+                << "  --three-hop-threshold <F>  acorn-1-3hop trigger (default 1.0): expand through\n"
+                << "                        predicate-failing 2-hop nodes to 3-hop when the 2-hop harvest is\n"
+                << "                        below connectivity_base x F. Only passing nodes are queued.\n"
+                << "  --bridge-budget-ratio <F> RACORN-1 bridge budget ratio (default: 1.0).\n"
+                << "                            Bridge budget = one_hop_count * ratio; used by the\n"
+                << "                            racorn-1 mode. acorn-1 mode always uses 0.0.\n"
+                << "  --early-termination-ms <N> Soft base-layer time budget in ms, fractional values\n"
+                << "                            kept (default: -1 = off).\n"
+                << "                            A traversal stops once the budget is spent AND the\n"
+                << "                            result heap holds ef_search candidates, so recall is\n"
+                << "                            traded for latency. Applies to every graph mode; exact\n"
+                << "                            search and the prefilter arms ignore it. Adds an EarlyTerm column\n"
+                << "                            (share of queries that stopped early).\n"
+                << "  --cmpkey                  Pass key-ascending neighbor_cmp to search (default: off)\n"
+                << "  --stride on|off           Stride-sample the 2-hop passed cap and the RACORN-1\n"
+                << "                            bridge pool (default: on). 'off' keeps the head of each\n"
+                << "                            pool instead (prefix truncation) - stride ablation.\n"
+                << "  --runs <N>                Measurement runs per query (default: 10)\n"
+                << "  --warmup <N>              Warmup runs before measurement (default: 3)\n"
+                << "  --json <path>             Write structured results (config + per-row metrics) as JSON.\n"
+                << "  --skip-exact              Skip the exact-search rows and the baseline row.\n"
+                << "                            (GT for recall is still computed/loaded.)\n"
+                << "  --modes <list>            Comma-separated modes to run.\n"
+                << "                            Valid: exact, prefilter, prefilter-scan, hnsw, acorn-1,\n"
+                << "                            acorn-1-3hop, racorn-1, navix-onehop-s, navix-blind,\n"
+                << "                            navix-directed, navix-local, navix-local-paper.\n"
+                << "                            prefilter = passing keys gathered upfront (assumed\n"
+                << "                            attribute index, untimed) + timed exact scan over them.\n"
+                << "                            prefilter-scan = no attribute index: every query scans the\n"
+                << "                            attribute column itself, then exact-scans what it collected.\n"
+                << "                            navix-* = the NaviX (VLDB 2025) heuristics on the same graph;\n"
+                << "                            navix-local follows the authors' code, navix-local-paper the paper's text.\n"
+                << "                            e.g. --modes hnsw,acorn-1 or --modes acorn-1,racorn-1\n"
+                << "                            Baseline (no-predicate) row skipped when set.\n"
+                << "                            Speedup/Recall/Dist ratios shown only when HNSW is included\n"
+                << "                            and --ef-values is not given.\n"
+                << "\n"
+                << "-- QPS benchmark mode (--qps) --------------------------------------\n"
+                << "  --ef-values <list>        Comma-separated ef_search values to sweep\n"
+                << "                            (default: 128,256,384,512). Replaces --ef-search.\n"
+                << "  --filter-first-threshold, --bridge-budget-ratio, --bridge-budget-ratios, --recall-target,\n"
+                << "  --early-termination-ms, --et-min-results, --cmpkey, --stride, --json\n"
+                << "                            As in the latency benchmark mode.\n"
+                << "  --runs <N>                Measurement runs per configuration (default: 10)\n"
+                << "                            Each run = full nq batch; reported QPS/latency are medians.\n"
+                << "  --warmup <N>              Warmup runs (default: 3)\n"
+                << "  --modes <list>            Comma-separated modes to run.\n"
+                << "                            Valid: hnsw, acorn-1, racorn-1, navix-*; exact, acorn-1-3hop\n"
+                << "                            and the prefilter modes are not run in QPS mode.\n"
+                << "  --skip-exact has no effect (already implied).\n";
             std::exit(0);
         } else {
             std::cerr << "Unknown option: " << arg << " (use --help)\n";
@@ -1244,15 +2186,24 @@ static void parse_args(int argc, char** argv) {
         n_max = TEXT2IMAGE_N_MAX;
         q_max = 100'000; // text2image query file has 100K vectors
         D_VAL = 200;
+    } else if (DATASET_NAME == "laion") {
+        n_max = LAION_N_MAX;
+        q_max = 1'000; // laion_query.fvecs holds the 1000 rows after the base prefix
+        D_VAL = 512;
+    } else if (DATASET_NAME == "yfcc") {
+        n_max = YFCC_N_MAX;
+        q_max = 100'000; // query.public.100K.u8bin
+        D_VAL = 192;
     } else {
         D_VAL = 128;
     }
-    // Default metric per dataset (if not explicitly set via --metric)
+    // Default metric per dataset (if not explicitly set via --metric).
+    // laion vectors are pre-normalized CLIP embeddings: cosine (re-normalization is a no-op).
     if (METRIC_NAME.empty()) {
-        if (DATASET_NAME == "text2image")
+        if (DATASET_NAME == "text2image" || DATASET_NAME == "laion")
             METRIC_NAME = "cosine";
         else
-            METRIC_NAME = "l2"; // sift, gist: L2 euclidean
+            METRIC_NAME = "l2"; // sift, gist, yfcc: L2 euclidean
     }
     if (N_VAL == 0 || N_VAL > n_max) {
         std::cerr << "--n must be between 1 and " << n_max << " for dataset '" << DATASET_NAME << "' (got " << N_VAL
@@ -1264,9 +2215,9 @@ static void parse_args(int argc, char** argv) {
         NUM_QUERIES = q_max;
     }
 
-    // --build-gt defaults: default GT_K to K; default nq to q_max only if not user-specified;
-    // default --search-threads to hardware_concurrency (GT is exact NN — embarrassingly parallel,
-    // so on shared boxes it is fine to use every available core for the one-time build).
+    // --build-gt defaults: GT_K defaults to K; nq defaults to q_max unless the user set it;
+    // --search-threads defaults to hardware_concurrency. GT is exact NN and embarrassingly
+    // parallel, so on shared boxes it is fine to use every available core for the one-time build.
     if (BUILD_GT_ONLY) {
         if (BUILD_GT_K == 0)
             BUILD_GT_K = K_VAL;
@@ -1305,28 +2256,17 @@ int run_benchmark(vector_store_t<float>& store, float const* query_vecs_data, st
     std::vector<float> query_data_owned; // storage for (possibly normalized) query vectors
     std::vector<float const*> queries;   // pointers into query_data_owned or store
 
-    if (!BUILD_INDEX_ONLY || BUILD_GT_ONLY) {
+    if (!BUILD_INDEX_ONLY) {
         if (num_queries > 0 && query_vecs_data) {
             std::size_t nq = std::min(num_queries, NUM_QUERIES);
-            query_data_owned.assign(query_vecs_data, query_vecs_data + nq * D);
+            query_data_owned.assign(query_vecs_data, query_vecs_data + nq * D_VAL);
             if (METRIC_NAME == "cosine") {
-                for (std::size_t qi = 0; qi < nq; ++qi) {
-                    float* v = query_data_owned.data() + qi * D;
-                    float norm_sq = 0;
-                    for (std::size_t d = 0; d < D; ++d)
-                        norm_sq += v[d] * v[d];
-                    float norm = std::sqrt(norm_sq);
-                    if (norm > 0) {
-                        float inv = 1.0f / norm;
-                        for (std::size_t d = 0; d < D; ++d)
-                            v[d] *= inv;
-                    }
-                }
+                normalize_rows_l2(query_data_owned.data(), nq, D_VAL);
                 std::cout << "Query vectors normalized to unit length.\n";
             }
             queries.reserve(nq);
             for (std::size_t qi = 0; qi < nq; ++qi)
-                queries.push_back(query_data_owned.data() + qi * D);
+                queries.push_back(query_data_owned.data() + qi * D_VAL);
             std::cout << "Using " << nq << " " << DATASET_NAME << " query vectors\n";
         } else {
             std::cerr << "No query vectors available for dataset '" << DATASET_NAME << "'\n";
@@ -1334,44 +2274,17 @@ int run_benchmark(vector_store_t<float>& store, float const* query_vecs_data, st
         }
     }
 
-    // ── Cluster correlation files (loaded once when --cluster-correlation != none).
-    if (CLUSTER_CORRELATION != cluster_correlation_t::none) {
-        std::string base_path = cluster_base_path();
-        std::string query_path = cluster_query_path();
-        std::cout << "Loading cluster files (K=" << CLUSTER_K << "):\n  " << base_path << "\n  " << query_path << "\n";
-        if (!load_cluster_file(base_path, NODE_CLUSTERS, N, CLUSTER_K, /*exact=*/true))
-            return 1;
-        // Query cluster file may have been built with the dataset's q_max
-        // (e.g. 100K for text2image) while the bench uses fewer queries —
-        // accept >= queries.size() (exact_count=false).
-        if (!load_cluster_file(query_path, QUERY_CLUSTERS, queries.size(), CLUSTER_K, /*exact=*/false))
-            return 1;
-        // Trim query clusters to the bench-time nq so downstream code can
-        // assume QUERY_CLUSTERS.size() == queries.size() (selectivity stats,
-        // negative-target picker, predicate factory all key off the index q).
-        if (QUERY_CLUSTERS.size() > queries.size())
-            QUERY_CLUSTERS.resize(queries.size());
-        std::cout << "  loaded base cluster IDs (" << NODE_CLUSTERS.size() << ") + query cluster IDs ("
-                  << QUERY_CLUSTERS.size() << ")\n";
-        if (CLUSTER_CORRELATION == cluster_correlation_t::negative) {
-            if (!populate_negative_targets(QUERY_CLUSTERS, CLUSTER_K, NEGATIVE_TARGET_SEED, NEGATIVE_TARGET_CLUSTERS))
-                return 1;
-            std::cout << "  computed " << NEGATIVE_TARGET_CLUSTERS.size()
-                      << " negative target cluster IDs (random non-self per query, seed="
-                      << NEGATIVE_TARGET_SEED << ")\n";
-        }
-    }
-
     // Build or load index
-    index_config_t config(M);
+    index_config_t config(M_VAL);
+    config.pruning_free = PRUNING_FREE;
     aligned_index_t<index_t> aligned(config);
     auto& index = *aligned.ptr;
 
-    std::size_t num_threads = std::thread::hardware_concurrency();
+    std::size_t num_threads = BUILD_THREADS ? BUILD_THREADS : std::thread::hardware_concurrency();
     if (num_threads == 0)
         num_threads = 4;
 
-    metric_t metric{&store, D};
+    metric_t metric{&store, D_VAL};
     std::string vol_path = index_volume_path();
     bool index_loaded = false;
 
@@ -1402,21 +2315,21 @@ int run_benchmark(vector_store_t<float>& store, float const* query_vecs_data, st
     }
 
     if (!index_loaded) {
-        index.reserve(index_limits_t(N, std::max(num_threads, SEARCH_THREADS)));
+        index.reserve(index_limits_t(N_VAL, std::max(num_threads, SEARCH_THREADS)));
 
         std::cout << "Building index with " << num_threads << " threads... " << std::flush;
         stopwatch_t build_timer;
 
         std::vector<std::thread> threads;
         threads.reserve(num_threads);
-        std::size_t chunk = (N + num_threads - 1) / num_threads;
+        std::size_t chunk = (N_VAL + num_threads - 1) / num_threads;
 
         for (std::size_t t = 0; t < num_threads; ++t) {
             std::size_t begin = t * chunk;
-            std::size_t end = std::min(begin + chunk, N);
+            std::size_t end = std::min(begin + chunk, N_VAL);
             threads.emplace_back([&, begin, end, t]() {
                 index_update_config_t ucfg;
-                ucfg.expansion = EF_CONSTRUCTION;
+                ucfg.expansion = EF_CONSTRUCTION_VAL;
                 ucfg.thread = t;
                 for (std::size_t i = begin; i < end; ++i)
                     index.add(static_cast<vec_key_t>(i), store.row(i), metric, ucfg);
@@ -1426,15 +2339,23 @@ int run_benchmark(vector_store_t<float>& store, float const* query_vecs_data, st
             th.join();
 
         double build_ms = build_timer.elapsed_ms();
+        BUILD_TIME_MS = build_ms;
         std::cout << "done (" << std::fixed << std::setprecision(1) << build_ms << " ms, "
-                  << static_cast<std::size_t>(N / (build_ms / 1000.0)) << " vec/s)\n";
+                  << static_cast<std::size_t>(N_VAL / (build_ms / 1000.0)) << " vec/s)\n";
         std::cout << "Index size: " << index.size() << "  [built from scratch]\n\n";
+    }
+
+    {
+        // Measured base-level average degree. Must come after both the load and
+        // the build-from-scratch paths: an empty index reports 0 here.
+        auto st = index.stats(0);
+        MAVG_BASE = st.nodes ? static_cast<double>(st.edges) / static_cast<double>(st.nodes) : 0.0;
     }
 
     // --build-index: save and exit
     if (BUILD_INDEX_ONLY) {
         std::error_code ec;
-        std::filesystem::create_directories(VOLUME_DIR, ec);  // no-op if exists
+        std::filesystem::create_directories(VOLUME_DIR, ec); // no-op if exists
         std::cout << "Saving index to " << vol_path << "... " << std::flush;
         stopwatch_t save_timer;
         auto result = index.save(vol_path.c_str());
@@ -1454,102 +2375,61 @@ int run_benchmark(vector_store_t<float>& store, float const* query_vecs_data, st
         double selectivity;
         std::size_t modulus;
         std::size_t pred_threshold;
-        double two_hop;
-        bool acorn;
-        bool racorn;
+        double filter_first_threshold; // passed to search (-1 for exact/hnsw)
         bool exact;
-        double fallback_exact_threshold; // 0 = plain RACORN-1 / disabled
+        double bridge_budget_ratio; // 0.0 = ACORN-1 / non-RACORN; >0.0 = RACORN-1
+        bool prefilter;             // pre-filtering + exact-scan baseline (index-free)
+        std::size_t navix;          // NaviX heuristic (0 off, 1 onehop-s, 2 blind, 3 directed, adaptive-local: 8 Kuzu, 5 paper)
+        double three_hop;           // ACORN-1 3-hop trigger (0.0 = two hops only)
     };
 
     auto gt_key = [](std::size_t mod, std::size_t thr) { return (mod << 20) | thr; };
 
-    // Cluster-mode selectivity statistics (computed when CLUSTER_CORRELATION != none).
-    // Mean is used as the case selectivity / display value; per-query distribution
-    // is reported alongside QPS / search summaries so we can see how cluster-size
-    // imbalance translates into per-query filter ratios.
-    cluster_sel_stats_t cluster_stats;
-    bool cluster_mode = (CLUSTER_CORRELATION != cluster_correlation_t::none);
-    bool cluster_pos = (CLUSTER_CORRELATION == cluster_correlation_t::positive);
-    std::string cluster_label_owned;
-    if (cluster_mode) {
-        auto const& target_clusters = cluster_pos ? QUERY_CLUSTERS : NEGATIVE_TARGET_CLUSTERS;
-        cluster_stats = compute_cluster_selectivity_stats(NODE_CLUSTERS, target_clusters, CLUSTER_K, N);
-        std::ostringstream lbl;
-        lbl << "Cluster " << (cluster_pos ? "Pos" : "Neg") << " K=" << CLUSTER_K;
-        cluster_label_owned = lbl.str();
-        std::cout << "\nCluster correlation: " << (cluster_pos ? "positive" : "negative") << " (K=" << CLUSTER_K
-                  << ")\n";
-        std::cout << "  per-query selectivity: mean=" << std::fixed << std::setprecision(4)
-                  << (cluster_stats.mean * 100.0) << "%  p50=" << (cluster_stats.p50 * 100.0)
-                  << "%  p90=" << (cluster_stats.p90 * 100.0) << "%  p95=" << (cluster_stats.p95 * 100.0)
-                  << "%  p99=" << (cluster_stats.p99 * 100.0) << "%  max=" << (cluster_stats.max * 100.0) << "%\n";
-    }
+    // RACORN-1 mode's bridge budget ratio (0.0 for all other modes). Set from
+    // --bridge-budget-ratio (default 1.0).
+    double const racorn_ratio = BRIDGE_BUDGET_RATIO;
+    double const three_hop_tau = THREE_HOP_TAU;
 
 #define CASE(sel_label, sel, mod, thr)                                                                                 \
-    {sel_label " | Exact", "exact", sel, mod, thr, -1.0, false, false, true, 0.0},                                     \
-        {sel_label " | HNSW", "hnsw", sel, mod, thr, -1.0, false, false, false, 0.0},                                  \
-        {sel_label " | ACORN-1", "acorn-1", sel, mod, thr, ACORN_THRESHOLD, true, false, false, 0.0},                  \
-        {sel_label " | RACORN-1", "racorn-1", sel, mod, thr, ACORN_THRESHOLD, true, true, false, 0.0},                 \
-        {sel_label " | RACORN-1+", "racorn-1+", sel,  mod,   thr,                                                      \
-         ACORN_THRESHOLD,          true,        true, false, FALLBACK_EXACT_THRESHOLD}
+    {sel_label " | Exact", "Exact", sel, mod, thr, -1.0, true, 0.0, false, 0, 0.0},                                    \
+        {sel_label " | Prefilter", "Prefilter", sel, mod, thr, -1.0, false, 0.0, true, 0, 0.0},                        \
+        {sel_label " | Prefilter-scan", "Prefilter-scan", sel, mod, thr, -1.0, false, 0.0, true, 0, 0.0},               \
+        {sel_label " | HNSW", "HNSW", sel, mod, thr, -1.0, false, 0.0, false, 0, 0.0},                                 \
+        {sel_label " | ACORN-1", "ACORN-1", sel, mod, thr, ACORN_THRESHOLD, false, 0.0, false, 0, 0.0},                \
+        {sel_label " | ACORN-1-3hop", "ACORN-1-3hop", sel, mod, thr, ACORN_THRESHOLD, false, 0.0, false, 0,            \
+         three_hop_tau},                                                                                               \
+        {sel_label " | RACORN-1", "RACORN-1", sel, mod, thr, ACORN_THRESHOLD, false, racorn_ratio, false, 0, 0.0},     \
+        {sel_label " | NaviX-onehop-s", "NaviX-onehop-s", sel, mod, thr, -1.0, false, 0.0, false, 1, 0.0},             \
+        {sel_label " | NaviX-blind", "NaviX-blind", sel, mod, thr, -1.0, false, 0.0, false, 2, 0.0},                   \
+        {sel_label " | NaviX-directed", "NaviX-directed", sel, mod, thr, -1.0, false, 0.0, false, 3, 0.0},             \
+        {sel_label " | NaviX-local", "NaviX-local", sel, mod, thr, -1.0, false, 0.0, false, 8, 0.0},                   \
+        {sel_label " | NaviX-local-paper", "NaviX-local-paper", sel, mod, thr, -1.0, false, 0.0, false, 5, 0.0}
 
-    std::vector<test_case_t> cases;
-    if (!cluster_mode) {
-        cases = {
-            CASE("Selectivity 100%", 1.000, 1, 1),       CASE("Selectivity  90%", 0.900, 10, 9),
-            CASE("Selectivity  70%", 0.700, 10, 7),      CASE("Selectivity  50%", 0.500, 2, 1),
-            CASE("Selectivity  30%", 0.300, 10, 3),      CASE("Selectivity  20%", 0.200, 10, 2),
-            CASE("Selectivity  10%", 0.100, 10, 1),      CASE("Selectivity   5%", 0.050, 20, 1),
-            CASE("Selectivity   4%", 0.040, 25, 1),      CASE("Selectivity   3%", 0.030, 100, 3),
-            CASE("Selectivity   2%", 0.020, 50, 1),      CASE("Selectivity   1%", 0.010, 100, 1),
-            CASE("Selectivity 0.8%", 0.0080, 125, 1),    CASE("Selectivity 0.6%", 0.0060, 500, 3),
-            CASE("Selectivity 0.5%", 0.0050, 200, 1),    CASE("Selectivity 0.4%", 0.0040, 250, 1),
-            CASE("Selectivity 0.3%", 0.0030, 1000, 3),   CASE("Selectivity 0.2%", 0.0020, 500, 1),
-            CASE("Selectivity 0.1%", 0.0010, 1000, 1),   CASE("Selectivity 0.05%", 0.0005, 2000, 1),
-            CASE("Selectivity 0.01%", 0.0001, 10000, 1),
-        };
-    } else {
-        // Cluster mode: one selectivity (mean per-query), 5 modes. Sentinel
-        // (modulus=0, threshold=CLUSTER_K) — modulo cases never use mod=0,
-        // so gt_key is collision-free across modes.
-        char const* base = cluster_label_owned.c_str();
-        // Build label strings owned by static storage via a small helper.
-        // Concatenate at allocation time — the labels live for the rest of the run.
-        static std::string lbl_exact, lbl_hnsw, lbl_acorn, lbl_racorn, lbl_racorn_plus;
-        lbl_exact = std::string(base) + " | Exact";
-        lbl_hnsw = std::string(base) + " | HNSW";
-        lbl_acorn = std::string(base) + " | ACORN-1";
-        lbl_racorn = std::string(base) + " | RACORN-1";
-        lbl_racorn_plus = std::string(base) + " | RACORN-1+";
-        double s = cluster_stats.mean;
-        std::size_t mod = 0;
-        std::size_t thr = CLUSTER_K;
-        cases = {
-            {lbl_exact.c_str(), "exact", s, mod, thr, -1.0, false, false, true, 0.0},
-            {lbl_hnsw.c_str(), "hnsw", s, mod, thr, -1.0, false, false, false, 0.0},
-            {lbl_acorn.c_str(), "acorn-1", s, mod, thr, ACORN_THRESHOLD, true, false, false, 0.0},
-            {lbl_racorn.c_str(), "racorn-1", s, mod, thr, ACORN_THRESHOLD, true, true, false, 0.0},
-            {lbl_racorn_plus.c_str(), "racorn-1+", s, mod, thr, ACORN_THRESHOLD, true, true, false,
-             FALLBACK_EXACT_THRESHOLD},
-        };
-    }
+    std::vector<test_case_t> cases = {
+        CASE("Selectivity 100%", 1.000, 1, 1),       CASE("Selectivity  90%", 0.900, 10, 9),
+        CASE("Selectivity  70%", 0.700, 10, 7),      CASE("Selectivity  50%", 0.500, 2, 1),
+        CASE("Selectivity  30%", 0.300, 10, 3),      CASE("Selectivity  20%", 0.200, 10, 2),
+        CASE("Selectivity   9%", 0.090, 100, 9),     CASE("Selectivity   7%", 0.070, 100, 7),
+        CASE("Selectivity  10%", 0.100, 10, 1),      CASE("Selectivity   5%", 0.050, 20, 1),
+        CASE("Selectivity   4%", 0.040, 25, 1),      CASE("Selectivity   3%", 0.030, 100, 3),
+        CASE("Selectivity   2%", 0.020, 50, 1),      CASE("Selectivity   1%", 0.010, 100, 1),
+        CASE("Selectivity 0.9%", 0.0090, 1000, 9),   CASE("Selectivity 0.7%", 0.0070, 1000, 7),
+        CASE("Selectivity 0.8%", 0.0080, 125, 1),    CASE("Selectivity 0.6%", 0.0060, 500, 3),
+        CASE("Selectivity 0.5%", 0.0050, 200, 1),    CASE("Selectivity 0.4%", 0.0040, 250, 1),
+        CASE("Selectivity 0.3%", 0.0030, 1000, 3),   CASE("Selectivity 0.2%", 0.0020, 500, 1),
+        CASE("Selectivity 0.1%", 0.0010, 1000, 1),   CASE("Selectivity 0.05%", 0.0005, 2000, 1),
+        CASE("Selectivity 0.01%", 0.0001, 10000, 1),
+    };
 #undef CASE
 
-    // Predicate-factory dispatch:
-    //   * modulo mode  → factory returns a fixed selectivity_predicate_t
-    //   * cluster mode → factory builds a per-query cluster_predicate_t
-    // Both factories accept the query index; modulo factory ignores it.
-    auto make_modulo_factory = [](std::size_t modulus, std::size_t pred_threshold) {
-        selectivity_predicate_t pred{modulus, pred_threshold};
+    // Predicate factory: returns a fixed selectivity_predicate_t for every query.
+    // The query index is ignored; it is kept for a uniform per-query factory signature.
+    auto make_modulo_factory = [&](std::size_t modulus, std::size_t pred_threshold) {
+        // Resolve the selectivity of this (modulus, threshold) case so the
+        // random-attribute predicate gets the matching attribute threshold.
+        double sel = static_cast<double>(pred_threshold) / static_cast<double>(modulus);
+        selectivity_predicate_t pred = make_case_predicate(modulus, pred_threshold, sel);
         return [pred](std::size_t /*q*/) { return pred; };
-    };
-    auto make_cluster_factory = [](bool positive) {
-        uint32_t const* nc = NODE_CLUSTERS.data();
-        // positive → query's own cluster id; negative → pre-computed random non-self target
-        uint32_t const* targets = positive ? QUERY_CLUSTERS.data() : NEGATIVE_TARGET_CLUSTERS.data();
-        return [nc, targets](std::size_t q) {
-            return cluster_predicate_t{nc, targets[q]};
-        };
     };
 
     // Filter cases to only those matching FILTER_SELECTIVITIES (if set)
@@ -1608,7 +2488,7 @@ int run_benchmark(vector_store_t<float>& store, float const* query_vecs_data, st
         //       [uint64 x gt_k] keys (unused slots = UINT64_MAX)
 
         std::error_code ec;
-        std::filesystem::create_directories(GT_DIR, ec);  // no-op if exists
+        std::filesystem::create_directories(GT_DIR, ec); // no-op if exists
         std::ofstream ofs(gt_path, std::ios::binary);
         if (!ofs.is_open()) {
             std::cerr << "Failed to open " << gt_path << " for writing\n";
@@ -1630,27 +2510,17 @@ int run_benchmark(vector_store_t<float>& store, float const* query_vecs_data, st
                       << ") ... " << std::flush;
             stopwatch_t gt_timer;
 
-            // Per-query predicate factory: cluster mode uses a per-query
-            // cluster_predicate_t (so each query filters by its own cluster id);
-            // modulo mode returns the same fixed predicate for every query.
+            // Per-query GT: exact filtered search under this case's predicate
+            // (modulo or random attribute), the same for every query.
             auto run_one = [&](std::size_t qi, std::size_t tid, std::vector<std::vector<vec_key_t>>& gts) {
                 index_search_config_t exact_cfg;
                 exact_cfg.exact = true;
                 exact_cfg.thread = tid;
-                if (cluster_mode) {
-                    uint32_t target = cluster_pos ? QUERY_CLUSTERS[qi] : NEGATIVE_TARGET_CLUSTERS[qi];
-                    cluster_predicate_t pred{NODE_CLUSTERS.data(), target};
-                    auto result = index.search(queries[qi], gt_k, metric, exact_cfg, pred);
-                    gts[qi].reserve(result.size());
-                    for (std::size_t ri = 0; ri < result.size(); ++ri)
-                        gts[qi].push_back(result[ri].member.key);
-                } else {
-                    selectivity_predicate_t pred{sel.modulus, sel.pred_threshold};
-                    auto result = index.search(queries[qi], gt_k, metric, exact_cfg, pred);
-                    gts[qi].reserve(result.size());
-                    for (std::size_t ri = 0; ri < result.size(); ++ri)
-                        gts[qi].push_back(result[ri].member.key);
-                }
+                selectivity_predicate_t pred = make_case_predicate(sel.modulus, sel.pred_threshold, sel.selectivity);
+                auto result = index.search(queries[qi], gt_k, metric, exact_cfg, pred);
+                gts[qi].reserve(result.size());
+                for (std::size_t ri = 0; ri < result.size(); ++ri)
+                    gts[qi].push_back(result[ri].member.key);
             };
 
             // Parallel GT computation
@@ -1727,16 +2597,15 @@ int run_benchmark(vector_store_t<float>& store, float const* query_vecs_data, st
     std::unordered_map<std::size_t, std::vector<std::vector<vec_key_t>>> gt_cache;
 
     // Helper: compute ground truth for all queries in parallel.
-    // Accepts a per-query predicate factory `make_pred(qi)` so cluster mode can
-    // build a query-specific cluster_predicate_t. Modulo callers wrap their
-    // fixed predicate in a constant lambda.
+    // Accepts a per-query predicate factory `make_pred(qi)`; modulo callers wrap
+    // their fixed predicate in a constant lambda.
     std::size_t gt_threads = std::min(SEARCH_THREADS, queries.size());
     auto compute_gt_parallel = [&](auto&& make_pred) {
         std::vector<std::vector<vec_key_t>> gts(queries.size());
         if (gt_threads <= 1) {
             for (std::size_t qi = 0; qi < queries.size(); ++qi) {
                 auto pred = make_pred(qi);
-                gts[qi] = compute_ground_truth(index, metric, queries[qi], K, pred, 0);
+                gts[qi] = compute_ground_truth(index, metric, queries[qi], K_VAL, pred, 0);
             }
         } else {
             std::vector<std::thread> pool;
@@ -1748,7 +2617,7 @@ int run_benchmark(vector_store_t<float>& store, float const* query_vecs_data, st
                 pool.emplace_back([&, qbegin, qend, t]() {
                     for (std::size_t qi = qbegin; qi < qend; ++qi) {
                         auto pred = make_pred(qi);
-                        gts[qi] = compute_ground_truth(index, metric, queries[qi], K, pred, t);
+                        gts[qi] = compute_ground_truth(index, metric, queries[qi], K_VAL, pred, t);
                     }
                 });
             }
@@ -1774,40 +2643,44 @@ int run_benchmark(vector_store_t<float>& store, float const* query_vecs_data, st
     }
 
     // Try to populate gt_cache from a previously saved GT file (--build-gt output).
-    // File path: gt_file_path(K, file_nq) where file_nq = dataset's q_max (build-gt forces it).
-    // Compatibility rules:
+    // Candidates are found by scanning GT_DIR for files whose name starts with the
+    // dataset/index prefix "{dataset}_{N}_{D}_m{M}_ef{EFC}{tag}_d{fingerprint}_gt_k" and
+    // ends in ".bin". These files differ only by their k/nq suffix. The exact-nq file for
+    // this run is tried first; the rest follow in sorted order.
+    // Compatibility rules per candidate:
     //   - file num_queries >= bench queries.size() (we use first queries.size() entries)
     //   - file gt_k >= K                           (we use first K keys per query)
     //   - selectivity match keyed by (modulus, threshold)
     {
-        // Try several common nq values (descending preference: exact match → q_max → 1000 → others).
-        // The first existing file with header `nq >= queries.size()` is used.
-        std::size_t qmax_for_dataset = (DATASET_NAME == "gist")         ? 1'000
-                                       : (DATASET_NAME == "text2image") ? 100'000
-                                                                        : 10'000; // sift
-        std::vector<std::size_t> candidate_nqs;
-        candidate_nqs.push_back(queries.size());   // exact bench-nq (preferred)
-        candidate_nqs.push_back(1000);             // build_all_gt.sh default
-        candidate_nqs.push_back(qmax_for_dataset); // legacy q_max files
-        candidate_nqs.push_back(100);              // bench default
-        // Keep only nq >= bench queries.size(), dedup preserving order
-        std::vector<std::size_t> tried;
-        std::string gt_path;
-        for (std::size_t nq : candidate_nqs) {
-            if (nq < queries.size())
+        std::ostringstream prefix_oss;
+        prefix_oss << DATASET_NAME << "_" << N_VAL << "_" << D_VAL << "_m" << M_VAL << "_ef" << EF_CONSTRUCTION_VAL
+                   << predicate_tag() << "_d" << BASE_FINGERPRINT << "_gt_k";
+        std::string const prefix = prefix_oss.str();
+
+        // Filename (not full path) of the ideal exact-nq GT file for this run.
+        std::string const exact_name = std::filesystem::path(gt_file_path(K_VAL, queries.size())).filename().string();
+
+        std::vector<std::string> candidates; // filenames only
+        std::error_code scan_ec;
+        for (auto const& entry : std::filesystem::directory_iterator(GT_DIR, scan_ec)) {
+            if (!entry.is_regular_file())
                 continue;
-            if (std::find(tried.begin(), tried.end(), nq) != tried.end())
-                continue;
-            tried.push_back(nq);
-            std::string p = gt_file_path(K, nq);
-            std::ifstream test(p);
-            if (test.good()) {
-                gt_path = p;
-                break;
-            }
+            std::string fname = entry.path().filename().string();
+            if (fname.size() >= 4 && fname.compare(0, prefix.size(), prefix) == 0 &&
+                fname.compare(fname.size() - 4, 4, ".bin") == 0)
+                candidates.push_back(fname);
         }
-        std::ifstream ifs(gt_path, std::ios::binary);
-        if (ifs.is_open()) {
+        std::sort(candidates.begin(), candidates.end());
+        // Move the exact-nq file to the front if present.
+        auto exact_it = std::find(candidates.begin(), candidates.end(), exact_name);
+        if (exact_it != candidates.end())
+            std::rotate(candidates.begin(), exact_it, exact_it + 1);
+
+        for (std::string const& fname : candidates) {
+            std::string gt_path = GT_DIR + "/" + fname;
+            std::ifstream ifs(gt_path, std::ios::binary);
+            if (!ifs.is_open())
+                continue;
             char magic[4] = {};
             ifs.read(magic, 4);
             uint32_t num_sels = 0, file_nq_hdr = 0, file_gt_k = 0;
@@ -1816,55 +2689,57 @@ int run_benchmark(vector_store_t<float>& store, float const* query_vecs_data, st
             ifs.read(reinterpret_cast<char*>(&file_gt_k), sizeof(file_gt_k));
 
             bool valid = ifs.good() && std::string(magic, 4) == "GT01" //
-                         && file_nq_hdr >= queries.size() && file_gt_k >= K;
+                         && file_nq_hdr >= queries.size() && file_gt_k >= K_VAL;
             if (!valid) {
                 std::cout << "GT file " << gt_path << " skipped (";
                 if (std::string(magic, 4) != "GT01")
                     std::cout << "bad magic";
                 else if (file_nq_hdr < queries.size())
                     std::cout << "nq=" << file_nq_hdr << " < bench " << queries.size();
-                else if (file_gt_k < K)
-                    std::cout << "gt_k=" << file_gt_k << " < K=" << K;
-                std::cout << "); recomputing.\n";
-            } else {
-                std::cout << "Loaded GT file: " << gt_path << " (" << num_sels << " selectivities, " << file_nq_hdr
-                          << " queries, gt_k=" << file_gt_k << ")\n";
-                std::vector<uint64_t> key_buf(file_gt_k);
-                for (uint32_t si = 0; si < num_sels && ifs.good(); ++si) {
-                    double sel_val = 0.0;
-                    uint64_t mod = 0, thr = 0;
-                    ifs.read(reinterpret_cast<char*>(&sel_val), sizeof(sel_val));
-                    ifs.read(reinterpret_cast<char*>(&mod), sizeof(mod));
-                    ifs.read(reinterpret_cast<char*>(&thr), sizeof(thr));
-                    std::size_t key = gt_key(static_cast<std::size_t>(mod), static_cast<std::size_t>(thr));
-
-                    std::vector<std::vector<vec_key_t>> gts(queries.size());
-                    for (std::size_t qi = 0; qi < file_nq_hdr; ++qi) {
-                        uint32_t cnt = 0;
-                        ifs.read(reinterpret_cast<char*>(&cnt), sizeof(cnt));
-                        ifs.read(reinterpret_cast<char*>(key_buf.data()), file_gt_k * sizeof(uint64_t));
-                        if (qi < queries.size()) {
-                            std::size_t use_cnt = std::min<std::size_t>(cnt, K);
-                            gts[qi].reserve(use_cnt);
-                            for (std::size_t ri = 0; ri < use_cnt; ++ri)
-                                if (key_buf[ri] != UINT64_MAX)
-                                    gts[qi].push_back(static_cast<vec_key_t>(key_buf[ri]));
-                        }
-                    }
-                    // Only insert if needed by current run (selectivity filter)
-                    bool needed = false;
-                    for (auto const& tc : cases) {
-                        if (!selectivity_matches(tc.selectivity))
-                            continue;
-                        if (gt_key(tc.modulus, tc.pred_threshold) == key) {
-                            needed = true;
-                            break;
-                        }
-                    }
-                    if (needed)
-                        gt_cache[key] = std::move(gts);
-                }
+                else if (file_gt_k < K_VAL)
+                    std::cout << "gt_k=" << file_gt_k << " < K=" << K_VAL;
+                std::cout << ")\n";
+                continue;
             }
+
+            std::cout << "Loaded GT file: " << gt_path << " (" << num_sels << " selectivities, " << file_nq_hdr
+                      << " queries, gt_k=" << file_gt_k << ")\n";
+            std::vector<uint64_t> key_buf(file_gt_k);
+            for (uint32_t si = 0; si < num_sels && ifs.good(); ++si) {
+                double sel_val = 0.0;
+                uint64_t mod = 0, thr = 0;
+                ifs.read(reinterpret_cast<char*>(&sel_val), sizeof(sel_val));
+                ifs.read(reinterpret_cast<char*>(&mod), sizeof(mod));
+                ifs.read(reinterpret_cast<char*>(&thr), sizeof(thr));
+                std::size_t key = gt_key(static_cast<std::size_t>(mod), static_cast<std::size_t>(thr));
+
+                std::vector<std::vector<vec_key_t>> gts(queries.size());
+                for (std::size_t qi = 0; qi < file_nq_hdr; ++qi) {
+                    uint32_t cnt = 0;
+                    ifs.read(reinterpret_cast<char*>(&cnt), sizeof(cnt));
+                    ifs.read(reinterpret_cast<char*>(key_buf.data()), file_gt_k * sizeof(uint64_t));
+                    if (qi < queries.size()) {
+                        std::size_t use_cnt = std::min<std::size_t>(cnt, K_VAL);
+                        gts[qi].reserve(use_cnt);
+                        for (std::size_t ri = 0; ri < use_cnt; ++ri)
+                            if (key_buf[ri] != UINT64_MAX)
+                                gts[qi].push_back(static_cast<vec_key_t>(key_buf[ri]));
+                    }
+                }
+                // Only insert if needed by current run (selectivity filter)
+                bool needed = false;
+                for (auto const& tc : cases) {
+                    if (!selectivity_matches(tc.selectivity))
+                        continue;
+                    if (gt_key(tc.modulus, tc.pred_threshold) == key) {
+                        needed = true;
+                        break;
+                    }
+                }
+                if (needed)
+                    gt_cache[key] = std::move(gts);
+            }
+            break;
         }
     }
 
@@ -1885,17 +2760,47 @@ int run_benchmark(vector_store_t<float>& store, float const* query_vecs_data, st
         if (gt_cache.count(key))
             continue;
         stopwatch_t gt_timer;
-        if (cluster_mode) {
-            auto factory = make_cluster_factory(cluster_pos);
-            gt_cache[key] = compute_gt_parallel(factory);
-        } else {
-            auto factory = make_modulo_factory(tc.modulus, tc.pred_threshold);
-            gt_cache[key] = compute_gt_parallel(factory);
-        }
+        auto factory = make_modulo_factory(tc.modulus, tc.pred_threshold);
+        gt_cache[key] = compute_gt_parallel(factory);
         ++gt_done;
         std::cout << "  [" << gt_done << "/" << gt_misses << "] " << tc.label << ": " << queries.size() << " queries ("
                   << std::setprecision(1) << gt_timer.elapsed_ms() << " ms)\n";
     }
+
+    // Shared summary config header (Vectors/Dimensions/... ) for both the QPS and
+    // latency summary tables. `qps` toggles the few mode-specific lines.
+    auto print_summary_config = [&](bool qps) {
+        std::cout << "  Vectors     : " << N_VAL << "\n";
+        std::cout << "  Dimensions  : " << D_VAL << "\n";
+        std::cout << "  Connectivity: " << M_VAL << "\n";
+        std::cout << "  EF construct: " << EF_CONSTRUCTION_VAL << "\n";
+        std::cout << "  Construction: " << (PRUNING_FREE ? "pruning-free" : "pruned (default)") << "\n";
+        std::cout << "  Predicate   : " << PREDICATE_KIND
+                  << (predicate_random() ? " (seed " + std::to_string(PREDICATE_SEED) + ")" : "") << "\n";
+        std::cout << "  K           : " << K_VAL << "\n";
+        if (!qps)
+            std::cout << "  EF search   : " << EF_SEARCH_VAL << "\n";
+        std::cout << "  ACORN thresh: " << ACORN_THRESHOLD << "\n";
+        if (early_termination_enabled())
+            std::cout << "  Early-term  : " << EARLY_TERMINATION_MS << " ms (soft)\n";
+        std::cout << "  Metric      : " << metric_label << "\n";
+        std::cout << "  Dataset     : " << DATASET_NAME << "\n";
+        if (qps) {
+            std::cout << "  Queries     : " << queries.size() << "\n";
+            std::cout << "  Runs        : " << BENCH_RUNS << " (" << BENCH_WARMUP << " warmup)\n";
+            std::cout << "  EF values   : ";
+            for (std::size_t i = 0; i < QPS_EF_VALUES.size(); ++i) {
+                if (i)
+                    std::cout << ", ";
+                std::cout << QPS_EF_VALUES[i];
+            }
+            std::cout << "\n";
+        }
+        std::cout << "  Search thr  : " << SEARCH_THREADS << "\n";
+        std::cout << "  Index source: " << (index_loaded ? "loaded (" + vol_path + ")" : "built from scratch") << "\n";
+        std::cout << "  Mavg (base) : " << std::fixed << std::setprecision(2) << MAVG_BASE << " (cap "
+                  << (2 * M_VAL) << ")\n";
+    };
 
     // ── QPS mode: sweep ef_search values, report recall & QPS ───────────────
     if (QPS_MODE) {
@@ -1921,22 +2826,37 @@ int run_benchmark(vector_store_t<float>& store, float const* query_vecs_data, st
 
         struct qps_mode_t {
             char const* name;
-            double two_hop;
-            bool racorn;
-            double fallback_exact_threshold;
+            double filter_first_threshold;
+            double bridge_budget_ratio;
+            std::size_t navix;
         };
         qps_mode_t all_modes[] = {
-            {"HNSW", -1.0, false, 0.0},
-            {"ACORN-1", ACORN_THRESHOLD, false, 0.0},
-            {"RACORN-1", ACORN_THRESHOLD, true, 0.0},
-            {"RACORN-1+", ACORN_THRESHOLD, true, FALLBACK_EXACT_THRESHOLD},
+            {"HNSW", -1.0, 0.0, 0},
+            {"ACORN-1", ACORN_THRESHOLD, 0.0, 0},
+            {"RACORN-1", ACORN_THRESHOLD, racorn_ratio, 0},
+            {"NaviX-onehop-s", -1.0, 0.0, 1},
+            {"NaviX-blind", -1.0, 0.0, 2},
+            {"NaviX-directed", -1.0, 0.0, 3},
+            {"NaviX-local", -1.0, 0.0, 8},
+            {"NaviX-local-paper", -1.0, 0.0, 5},
         };
+        // racorn-1 expands into one entry per --bridge-budget-ratios value.
+        std::vector<double> const qps_bbr =
+            BBR_VALUES.empty() ? std::vector<double>{racorn_ratio} : BBR_VALUES;
         std::vector<qps_mode_t> modes;
-        for (auto const& m : all_modes)
-            if (mode_matches(m.name))
+        for (auto const& m : all_modes) {
+            if (!mode_matches(m.name))
+                continue;
+            if (iequals(m.name, "RACORN-1")) {
+                for (double br : qps_bbr)
+                    modes.push_back({m.name, m.filter_first_threshold, br, 0});
+            } else {
                 modes.push_back(m);
+            }
+        }
         if (modes.empty()) {
-            std::cerr << "Error: no QPS modes selected (QPS mode does not support --modes exact).\n";
+            std::cerr << "Error: no QPS modes selected (valid QPS modes: hnsw, acorn-1, racorn-1, navix-*; 'exact' and "
+                         "'prefilter' are not supported).\n";
             return 1;
         }
         if (unique_sels.empty()) {
@@ -1947,10 +2867,12 @@ int run_benchmark(vector_store_t<float>& store, float const* query_vecs_data, st
         struct qps_row_t {
             double selectivity;
             char const* mode;
+            double bridge_budget_ratio;
             std::size_t ef_search;
             double recall;
             double qps;
             double latency_ms;
+            double early_term_rate;
         };
         std::vector<qps_row_t> rows;
 
@@ -1963,31 +2885,26 @@ int run_benchmark(vector_store_t<float>& store, float const* query_vecs_data, st
 
             for (auto const& m : modes) {
                 for (std::size_t ef : QPS_EF_VALUES) {
-                    // RACORN-1+ dynamic threshold: scales with ef_search (so larger
-                    // searches see proportionally more fallback samples before the
-                    // heuristic fires) and shrinks 10× when N > 1M (where each
-                    // fallback round explores a much smaller fraction of the index).
-                    // Plain RACORN-1 / HNSW / ACORN-1 keep `m.fallback_exact_threshold = 0`
-                    // and pass it through unchanged.
-                    double dynamic_thr = m.fallback_exact_threshold;
-                    if (dynamic_thr > 0) {
-                        double ef_factor = static_cast<double>(ef) / 200.0;
-                        double n_factor = (N <= 1'000'000) ? 1.0 : 0.1;
-                        dynamic_thr *= ef_factor * n_factor;
-                    }
                     auto run_with = [&](auto&& factory) {
-                        return run_qps_search(index, metric, queries, K, ef, factory, m.two_hop, m.racorn, dynamic_thr,
-                                              gt);
+                        return run_qps_search(index, metric, queries, K_VAL, ef, factory, m.filter_first_threshold,
+                                              m.bridge_budget_ratio, gt, m.navix);
                     };
-                    qps_result_t r = cluster_mode ? run_with(make_cluster_factory(cluster_pos))
-                                                  : run_with(make_modulo_factory(sel.modulus, sel.pred_threshold));
-                    rows.push_back({sel.selectivity, m.name, ef, r.recall, r.qps, r.latency_ms});
+                    qps_result_t r = run_with(make_modulo_factory(sel.modulus, sel.pred_threshold));
+                    rows.push_back({sel.selectivity, m.name, m.bridge_budget_ratio, ef, r.recall, r.qps, r.latency_ms,
+                                    r.early_term_rate});
                     ++done;
                     std::cout << "\r  [" << done << "/" << total_configs << "] " << std::fixed << std::setprecision(1)
                               << (sel.selectivity * 100.0) << "% | " << m.name << " | ef=" << ef
                               << " => recall=" << std::setprecision(4) << r.recall << "  qps=" << std::setprecision(0)
-                              << r.qps << "  lat=" << std::setprecision(3) << r.latency_ms << "ms"
-                              << "        " << std::flush;
+                              << r.qps << "  lat=" << std::setprecision(3) << r.latency_ms << "ms";
+                    if (early_termination_enabled())
+                        std::cout << "  early=" << std::setprecision(1) << (r.early_term_rate * 100.0) << "%";
+                    std::cout << "        " << std::flush;
+                    // Same early-stop rule as the latency-mode sweep: once this
+                    // (selectivity, mode, br) series reaches the recall target,
+                    // larger ef values add no curve information.
+                    if (RECALL_TARGET > 0 && r.recall >= RECALL_TARGET)
+                        break;
                 }
             }
         }
@@ -1998,55 +2915,18 @@ int run_benchmark(vector_store_t<float>& store, float const* query_vecs_data, st
         std::cout << " QPS Benchmark Summary\n";
         std::cout << "========================================================\n\n";
 
-        std::cout << "  Vectors     : " << N << "\n";
-        std::cout << "  Dimensions  : " << D << "\n";
-        std::cout << "  Connectivity: " << M << "\n";
-        std::cout << "  EF construct: " << EF_CONSTRUCTION << "\n";
-        std::cout << "  K           : " << K << "\n";
-        std::cout << "  ACORN thresh: " << ACORN_THRESHOLD << "\n";
-        std::cout << "  Bridge ratio: " << BRIDGE_BUDGET_RATIO << "\n";
-        if (FALLBACK_EXACT_THRESHOLD > 0) {
-            double ef_lo = static_cast<double>(*std::min_element(QPS_EF_VALUES.begin(), QPS_EF_VALUES.end()));
-            double ef_hi = static_cast<double>(*std::max_element(QPS_EF_VALUES.begin(), QPS_EF_VALUES.end()));
-            double nf = (N <= 1'000'000) ? 1.0 : 0.1;
-            std::cout << std::fixed << std::setprecision(4)
-                      << "  FB threshold: " << FALLBACK_EXACT_THRESHOLD
-                      << " (QPS dynamic: base×ef/200"
-                      << (nf < 1.0 ? "×0.1 (N>1M)" : "")
-                      << " → " << (FALLBACK_EXACT_THRESHOLD * ef_lo / 200.0 * nf)
-                      << ".." << (FALLBACK_EXACT_THRESHOLD * ef_hi / 200.0 * nf) << ")\n";
-        }
-#if USEARCH_ENABLE_3HOP
-        std::cout << "  3hop thresh : " << THREE_HOP_THRESHOLD << "\n";
-#endif
-        std::cout << "  Metric      : " << metric_label << "\n";
-        std::cout << "  Dataset     : " << DATASET_NAME << "\n";
-        std::cout << "  Queries     : " << queries.size() << "\n";
-        std::cout << "  Search thr  : " << SEARCH_THREADS << "\n";
-        std::cout << "  Runs        : " << BENCH_RUNS << " (" << BENCH_WARMUP << " warmup)\n";
-        std::cout << "  EF values   : ";
-        for (std::size_t i = 0; i < QPS_EF_VALUES.size(); ++i) {
-            if (i)
-                std::cout << ", ";
-            std::cout << QPS_EF_VALUES[i];
-        }
-        std::cout << "\n  Index source: " << (index_loaded ? "loaded (" + vol_path + ")" : "built from scratch")
-                  << "\n";
-        if (cluster_mode) {
-            std::cout << "  Correlation : " << (cluster_pos ? "positive" : "negative") << " (cluster K=" << CLUSTER_K
-                      << ")\n";
-            std::cout << "  Per-q sel.  : mean=" << std::fixed << std::setprecision(4)
-                      << (cluster_stats.mean * 100.0) << "%  p50=" << (cluster_stats.p50 * 100.0)
-                      << "%  p90=" << (cluster_stats.p90 * 100.0) << "%  p95=" << (cluster_stats.p95 * 100.0)
-                      << "%  p99=" << (cluster_stats.p99 * 100.0) << "%\n";
-        }
+        print_summary_config(/*qps=*/true);
         std::cout << "\n";
 
-        std::cout << std::left << std::setw(14) << "Selectivity" << std::setw(12) << "Mode" << std::right
-                  << std::setw(10) << "EF_Search" << std::setw(10) << "Recall" << std::setw(14) << "Latency(ms)"
-                  << std::setw(12) << "QPS"
-                  << "\n";
-        std::cout << std::string(72, '-') << "\n";
+        std::cout << std::left << std::setw(14) << "Selectivity" << std::setw(16) << "Mode" << std::right
+                  << std::setw(7) << "BR" << std::setw(10) << "EF_Search" << std::setw(10) << "Recall" << std::setw(14)
+                  << "Latency(ms)" << std::setw(12) << "QPS";
+        if (early_termination_enabled())
+            std::cout << std::setw(12) << "EarlyTerm";
+        std::cout << "\n";
+        // Rule widens with the optional early-termination column.
+        std::size_t const qps_table_width = early_termination_enabled() ? 95 : 83;
+        std::cout << std::string(qps_table_width, '-') << "\n";
 
         double prev_sel = -1.0;
         for (auto const& row : rows) {
@@ -2061,13 +2941,53 @@ int run_benchmark(vector_store_t<float>& store, float const* query_vecs_data, st
                     oss << std::fixed << std::setprecision(2) << (row.selectivity * 100) << "%";
                 sel_str = oss.str();
                 if (prev_sel >= 0)
-                    std::cout << std::string(72, '-') << "\n";
+                    std::cout << std::string(qps_table_width, '-') << "\n";
                 prev_sel = row.selectivity;
             }
-            std::cout << std::left << std::setw(14) << sel_str << std::setw(12) << row.mode << std::right
-                      << std::setw(10) << row.ef_search << std::fixed << std::setprecision(4) << std::setw(10)
+            std::cout << std::left << std::setw(14) << sel_str << std::setw(16) << row.mode << std::right;
+            if (row.bridge_budget_ratio > 0)
+                std::cout << std::fixed << std::setprecision(1) << std::setw(7) << row.bridge_budget_ratio;
+            else
+                std::cout << std::setw(7) << "-";
+            std::cout << std::setw(10) << row.ef_search << std::fixed << std::setprecision(4) << std::setw(10)
                       << row.recall << std::setprecision(3) << std::setw(14) << row.latency_ms << std::setprecision(0)
-                      << std::setw(12) << row.qps << "\n";
+                      << std::setw(12) << row.qps;
+            if (early_termination_enabled())
+                std::cout << std::setprecision(1) << std::setw(11) << (row.early_term_rate * 100.0) << "%";
+            std::cout << "\n";
+        }
+
+        // Structured output for chart generation — same field names as the
+        // latency-mode JSON where the semantics coincide, plus "qps".
+        if (!JSON_PATH.empty()) {
+            std::ofstream ofs(JSON_PATH);
+            if (!ofs) {
+                std::cerr << "Failed to open --json path: " << JSON_PATH << "\n";
+            } else {
+                ofs << "{\n  \"config\": {\n";
+                ofs << "    \"dataset\": \"" << json_escape(DATASET_NAME) << "\",\n";
+                ofs << "    \"n\": " << N_VAL << ", \"d\": " << D_VAL << ", \"m\": " << M_VAL
+                    << ", \"ef_construction\": " << EF_CONSTRUCTION_VAL << ",\n";
+                ofs << "    \"k\": " << K_VAL << ", \"metric\": \"" << json_escape(METRIC_NAME)
+                    << "\", \"mode\": \"qps\",\n";
+                ofs << "    \"warmup\": " << BENCH_WARMUP << ", \"runs\": " << BENCH_RUNS
+                    << ", \"search_threads\": " << SEARCH_THREADS << ",\n";
+                ofs << "    \"cmpkey\": " << (USE_CMPKEY ? "true" : "false")
+                    << ", \"stride_sampling\": " << (STRIDE_SAMPLING ? "true" : "false")
+                    << ", \"mavg\": " << MAVG_BASE
+                    << ", \"pruning_free\": " << (PRUNING_FREE ? "true" : "false") << "\n  },\n  \"results\": [\n";
+                for (std::size_t i = 0; i < rows.size(); ++i) {
+                    auto const& r = rows[i];
+                    ofs << "    {\"mode\": \"" << json_escape(r.mode) << "\", \"selectivity\": " << std::setprecision(6)
+                        << r.selectivity << ", \"ef_search\": " << r.ef_search
+                        << ", \"bridge_budget_ratio\": " << r.bridge_budget_ratio << ", \"recall\": " << r.recall
+                        << ", \"qps\": " << r.qps << ", \"latency_ms\": " << r.latency_ms
+                        << ", \"early_term_rate\": " << r.early_term_rate << "}" << (i + 1 < rows.size() ? "," : "")
+                        << "\n";
+                }
+                ofs << "  ]\n}\n";
+                std::cout << "\nWrote JSON results to " << JSON_PATH << " (" << rows.size() << " rows)\n";
+            }
         }
 
         std::cout << "\n========================================================\n";
@@ -2085,8 +3005,7 @@ int run_benchmark(vector_store_t<float>& store, float const* query_vecs_data, st
         return mode_matches(tc.mode);
     };
     // Baseline (no-predicate HNSW) only makes sense if no mode filter is active and exact is not skipped.
-    // In cluster correlation mode the baseline is meaningless (every node passes), so skip it.
-    bool show_baseline = FILTER_MODES.empty() && !SKIP_EXACT && !cluster_mode;
+    bool show_baseline = FILTER_MODES.empty() && !SKIP_EXACT;
 
     // Count total search cases
     std::size_t search_total = 0;
@@ -2113,11 +3032,127 @@ int run_benchmark(vector_store_t<float>& store, float const* query_vecs_data, st
         dummy_predicate_t no_pred;
         auto baseline_factory = [no_pred](std::size_t /*q*/) { return no_pred; };
         auto gt_base = compute_gt_parallel(baseline_factory);
-        summaries.push_back(run_search(index, metric, queries, K, EF_SEARCH, baseline_factory, -1.0, false, false,
-                                       "Baseline (no predicate)", 1.0, false, 0.0, gt_base));
+        summaries.push_back(run_search(index, metric, queries, K_VAL, EF_SEARCH_VAL, baseline_factory, -1.0, false,
+                                       "Baseline (no predicate)", "NoPred", 1.0, 0.0, gt_base));
         ++search_done;
         std::cout.flush();
     }
+
+    // Latency-mode sweep lists. --ef-values turns the single-ef run into an ef
+    // sweep. --bridge-budget-ratios expands racorn-1 into one series per ratio.
+    std::vector<std::size_t> const ef_sweep =
+        EF_VALUES_SET ? QPS_EF_VALUES : std::vector<std::size_t>{EF_SEARCH_VAL};
+    std::vector<double> const bbr_sweep = BBR_VALUES.empty() ? std::vector<double>{racorn_ratio} : BBR_VALUES;
+
+    auto format_br = [](double br) {
+        std::ostringstream oss;
+        oss << std::setprecision(3) << br;
+        return oss.str();
+    };
+    auto format_ms = [](double ms) {
+        std::ostringstream oss;
+        oss << std::fixed << std::setprecision(2) << ms;
+        return oss.str();
+    };
+    auto format_frac = [](double f) {
+        std::ostringstream oss;
+        oss << std::setprecision(4) << f;
+        return oss.str();
+    };
+
+    // Per-mode ef override (--mode-ef). Labels carry ef whenever any sweep may
+    // hold more than one value, so rows of different ef never share a label.
+    auto ef_list_for = [&](std::string const& mode) -> std::vector<std::size_t> const& {
+        for (auto const& me : MODE_EF)
+            if (iequals(me.first, mode))
+                return me.second;
+        return ef_sweep;
+    };
+    bool const label_ef = EF_VALUES_SET || !MODE_EF.empty();
+
+    // --et-anchor bookkeeping. Per selectivity key: the measured prefill p50 of
+    // each anchor (NaN until its unbudgeted row ran), and the series whose ladder
+    // rows wait for them. Cases are grouped by selectivity. So if the key changes
+    // while ladders are still waiting, an anchor series never ran. We then abort
+    // loudly rather than silently drop the budget rows.
+    double const nan_v = std::numeric_limits<double>::quiet_NaN();
+    std::unordered_map<std::size_t, std::vector<double>> anchor_ms;
+    struct pending_ladder_t {
+        test_case_t const* tc;
+        double br;
+        std::size_t ef;
+        std::string label;
+        double p50_off;
+    };
+    std::vector<pending_ladder_t> pending_ladders;
+    std::size_t pending_key = 0;
+    bool have_pending_key = false;
+    auto anchors_ready = [&](std::size_t key) {
+        if (ET_ANCHORS.empty())
+            return true;
+        auto it = anchor_ms.find(key);
+        if (it == anchor_ms.end())
+            return false;
+        for (double v : it->second)
+            if (std::isnan(v))
+                return false;
+        return true;
+    };
+    auto fail_if_pending = [&]() {
+        if (pending_ladders.empty())
+            return;
+        std::cerr << "Error: " << pending_ladders.size() << " series at selectivity "
+                  << pending_ladders.front().tc->selectivity
+                  << " are waiting for an --et-anchor series that never ran. Enable the anchor mode "
+                     "(--modes) and its ef (--mode-ef / --ef-values), and keep --recall-target off.\n";
+        std::exit(1);
+    };
+
+    // Soft-timeout ladder for one series. Its budgets come from three sources:
+    // fractions of the series' own unlimited p50 (--early-termination-fractions),
+    // absolute values (--early-termination-ms-values), and anchor fractions
+    // (--et-anchor). Anchor fractions apply to graph series only, once the anchors
+    // of this selectivity are measured.
+    struct budget_t {
+        double ms;
+        std::string anchor;
+        double fraction;
+    };
+    auto budget_ladder = [&](std::size_t key, double p50_off, bool with_anchors) {
+        std::vector<budget_t> budgets;
+        for (double f : ET_FRACTIONS)
+            budgets.push_back({f * p50_off, "", nan_v});
+        for (double ms : ET_MS_VALUES)
+            budgets.push_back({ms, "", nan_v});
+        if (with_anchors && !ET_ANCHORS.empty()) {
+            auto it = anchor_ms.find(key);
+            for (std::size_t ai = 0; ai < ET_ANCHORS.size(); ++ai) {
+                double const base = it == anchor_ms.end() ? nan_v : it->second[ai];
+                for (double f : ET_ANCHORS[ai].fractions)
+                    budgets.push_back({f * base, ET_ANCHORS[ai].name, f});
+            }
+        }
+        return budgets;
+    };
+    // Budget rows of one graph series. Called right after the series' unbudgeted
+    // row, or later from the pending list once the anchors exist.
+    auto run_ladder = [&](test_case_t const& tc, double br, std::size_t ef, std::string const& label,
+                          double p50_off, std::size_t key) {
+        auto factory = make_modulo_factory(tc.modulus, tc.pred_threshold);
+        for (auto const& b : budget_ladder(key, p50_off, true)) {
+            std::string lbl = label + " et=" + format_ms(b.ms) + "ms";
+            if (!b.anchor.empty())
+                lbl += " (" + b.anchor + " x" + format_frac(b.fraction) + ")";
+            auto t = run_search(index, metric, queries, K_VAL, ef, factory, tc.filter_first_threshold, false,
+                                lbl.c_str(), tc.mode, tc.selectivity, br, gt_cache[key], tc.navix, b.ms,
+                                tc.three_hop);
+            t.early_termination_ms = b.ms;
+            t.et_anchor = b.anchor;
+            t.et_fraction = b.fraction;
+            summaries.push_back(t);
+            std::cout.flush();
+        }
+    };
 
     for (auto const& tc : cases) {
         if (!selectivity_matches(tc.selectivity))
@@ -2125,80 +3160,157 @@ int run_benchmark(vector_store_t<float>& store, float const* query_vecs_data, st
         if (!case_enabled(tc))
             continue;
         ++search_done;
-        std::size_t eligible = static_cast<std::size_t>(N * tc.selectivity);
+        std::size_t eligible = static_cast<std::size_t>(N_VAL * tc.selectivity);
         std::cout << "\n--- [" << search_done << "/" << search_total << "] " << tc.label << " ---";
-        std::cout << "\n  Eligible vectors : ~" << eligible << " / " << N << " (" << std::fixed << std::setprecision(1)
-                  << (tc.selectivity * 100.0) << "%)\n";
+        std::cout << "\n  Eligible vectors : ~" << eligible << " / " << N_VAL << " (" << std::fixed
+                  << std::setprecision(1) << (tc.selectivity * 100.0) << "%)\n";
 
         std::size_t key = gt_key(tc.modulus, tc.pred_threshold);
-        auto run_with = [&](auto&& factory) {
-            return run_search(index, metric, queries, K, EF_SEARCH, factory, tc.two_hop, tc.racorn, tc.exact, tc.label,
-                              tc.selectivity, tc.acorn, tc.fallback_exact_threshold, gt_cache[key]);
-        };
-        summaries.push_back(cluster_mode ? run_with(make_cluster_factory(cluster_pos))
-                                         : run_with(make_modulo_factory(tc.modulus, tc.pred_threshold)));
-        // Persist log immediately after each (selectivity, mode) cell completes — so the
-        // file reflects in-progress state if the process is interrupted or hangs later.
-        std::cout.flush();
+        if (have_pending_key && key != pending_key)
+            fail_if_pending();
+        pending_key = key;
+        have_pending_key = true;
+
+        if (tc.prefilter) {
+            bool const per_query_scan = iequals(tc.mode, "Prefilter-scan");
+            std::string label = tc.label;
+            if (et_ladder_enabled())
+                label += " et=off";
+            auto s = run_prefilter_search(metric, queries, K_VAL, tc.modulus, tc.pred_threshold, label.c_str(),
+                                          tc.mode, tc.selectivity, gt_cache[key], 0, -1.0, per_query_scan);
+            summaries.push_back(s);
+            std::cout.flush();
+            // Prefilter rows take the self-relative and absolute ladders only. Anchor
+            // budgets are a graph-series comparison, and prefilter runs before the anchors.
+            for (auto const& b : budget_ladder(key, s.latency_p50, false)) {
+                std::string lbl = tc.label + std::string(" et=") + format_ms(b.ms) + "ms";
+                auto t = run_prefilter_search(metric, queries, K_VAL, tc.modulus, tc.pred_threshold, lbl.c_str(),
+                                              tc.mode, tc.selectivity, gt_cache[key], EF_SEARCH_VAL, b.ms,
+                                              per_query_scan);
+                t.early_termination_ms = b.ms;
+                summaries.push_back(t);
+                std::cout.flush();
+            }
+            continue;
+        }
+
+        bool const is_racorn = iequals(tc.mode, "RACORN-1");
+        std::vector<double> const br_list = is_racorn ? bbr_sweep : std::vector<double>{tc.bridge_budget_ratio};
+        // Exact search ignores ef; run it once regardless of the sweep.
+        std::vector<std::size_t> const ef_list =
+            tc.exact ? std::vector<std::size_t>{EF_SEARCH_VAL} : ef_list_for(tc.mode);
+
+        for (double br : br_list) {
+            for (std::size_t ef : ef_list) {
+                std::string label = tc.label;
+                if (label_ef && !tc.exact)
+                    label += " ef=" + std::to_string(ef);
+                if (is_racorn && bbr_sweep.size() > 1)
+                    label += " br=" + format_br(br);
+                auto factory = make_modulo_factory(tc.modulus, tc.pred_threshold);
+                bool const skip_off = ET_SKIP_UNBUDGETED && !tc.exact && ET_FRACTIONS.empty() && !ET_MS_VALUES.empty();
+                search_result_summary_t s{};
+                if (!skip_off) {
+                    std::string off_label = label + (et_ladder_enabled() && !tc.exact ? " et=off" : "");
+                    s = run_search(index, metric, queries, K_VAL, ef, factory, tc.filter_first_threshold, tc.exact,
+                                   off_label.c_str(), tc.mode, tc.selectivity, br, gt_cache[key], tc.navix,
+                                   EARLY_TERMINATION_MS, tc.three_hop);
+                    s.early_termination_ms = EARLY_TERMINATION_MS;
+                    summaries.push_back(s);
+                    // Persist the log immediately after each cell completes, so the file
+                    // reflects the in-progress state if the process is interrupted later.
+                    std::cout.flush();
+                }
+                // Is this unbudgeted row an --et-anchor? Record its prefill p50 for
+                // the whole selectivity. A br sweep makes the anchor ambiguous.
+                if (!skip_off && !tc.exact) {
+                    for (std::size_t ai = 0; ai < ET_ANCHORS.size(); ++ai) {
+                        auto const& a = ET_ANCHORS[ai];
+                        if (!iequals(a.mode, tc.mode) || a.ef != ef)
+                            continue;
+                        if (is_racorn && bbr_sweep.size() > 1) {
+                            std::cerr << "Error: --et-anchor " << a.name << " on a mode with a br sweep is ambiguous\n";
+                            std::exit(1);
+                        }
+                        if (std::isnan(s.prefill_ms_p50)) {
+                            std::cerr << "Error: anchor series " << a.name << " never filled W at selectivity "
+                                      << tc.selectivity << " — no deadline reference for this cell\n";
+                            std::exit(1);
+                        }
+                        auto& slot = anchor_ms[key];
+                        if (slot.empty())
+                            slot.assign(ET_ANCHORS.size(), nan_v);
+                        slot[ai] = s.prefill_ms_p50;
+                        std::cout << "  [et-anchor] " << a.name << " prefill p50 = " << format_ms(s.prefill_ms_p50)
+                                  << " ms\n";
+                    }
+                }
+                // Timeout ladder (graph modes only). With anchors, the rows wait until
+                // every anchor of this selectivity exists. The waiting series then run
+                // first, in their original order, so the JSON keeps the series order.
+                if (!tc.exact) {
+                    if (anchors_ready(key)) {
+                        for (auto const& p : pending_ladders)
+                            run_ladder(*p.tc, p.br, p.ef, p.label, p.p50_off, key);
+                        pending_ladders.clear();
+                        run_ladder(tc, br, ef, label, s.latency_p50, key);
+                    } else {
+                        pending_ladders.push_back({&tc, br, ef, label, s.latency_p50});
+                    }
+                }
+                if (!tc.exact && !skip_off && RECALL_TARGET > 0 && s.recall >= RECALL_TARGET)
+                    break; // target recall reached; larger ef adds no curve information
+            }
+        }
     }
+    if (have_pending_key)
+        fail_if_pending();
 
     // ── Summary table ───────────────────────────────────────────────────────
     std::cout << "\n========================================================\n";
     std::cout << " Summary\n";
     std::cout << "========================================================\n\n";
 
-    std::cout << "  Vectors     : " << N << "\n";
-    std::cout << "  Dimensions  : " << D << "\n";
-    std::cout << "  Connectivity: " << M << "\n";
-    std::cout << "  EF construct: " << EF_CONSTRUCTION << "\n";
-    std::cout << "  K           : " << K << "\n";
-    std::cout << "  EF search   : " << EF_SEARCH << "\n";
-    std::cout << "  ACORN thresh: " << ACORN_THRESHOLD << "\n";
-    std::cout << "  Bridge ratio: " << BRIDGE_BUDGET_RATIO << "\n";
-    if (FALLBACK_EXACT_THRESHOLD > 0)
-        std::cout << std::fixed << std::setprecision(4)
-                  << "  FB threshold: " << FALLBACK_EXACT_THRESHOLD << "\n";
-#if USEARCH_ENABLE_3HOP
-    std::cout << "  3hop thresh : " << THREE_HOP_THRESHOLD << "\n";
-#endif
-    std::cout << "  Metric      : " << metric_label << "\n";
-    std::cout << "  Dataset     : " << DATASET_NAME << "\n";
-    std::cout << "  Search thr  : " << SEARCH_THREADS << "\n";
-    std::cout << "  Index source: " << (index_loaded ? "loaded (" + vol_path + ")" : "built from scratch") << "\n";
-    if (cluster_mode) {
-        std::cout << "  Correlation : " << (cluster_pos ? "positive" : "negative") << " (cluster K=" << CLUSTER_K
-                  << ")\n";
-        std::cout << "  Per-q sel.  : mean=" << std::fixed << std::setprecision(4) << (cluster_stats.mean * 100.0)
-                  << "%  p50=" << (cluster_stats.p50 * 100.0) << "%  p90=" << (cluster_stats.p90 * 100.0)
-                  << "%  p95=" << (cluster_stats.p95 * 100.0) << "%  p99=" << (cluster_stats.p99 * 100.0) << "%\n";
-    }
+    print_summary_config(/*qps=*/false);
     std::cout << "\n";
 
-    std::cout << std::left << std::setw(14) << "Selectivity" << std::setw(11) << "Mode" << std::right << std::setw(12)
-              << "Latency(ms)" << std::setw(14) << "Dist.Computed" << std::setw(14) << "NodesVisited" << std::setw(10)
-              << "Recall(avg)" << std::setw(12) << "RecallRatio" << std::setw(10) << "Speedup" << std::setw(10)
-              << "DistRatio" << std::setw(12) << "PredEvals" << std::setw(10) << "FBCount" << std::setw(10) << "FBSelec"
-              << std::setw(9) << "FBExact"
-              << "\n";
-    std::cout << std::string(148, '-') << "\n";
-
-    // Extract mode name from a label like "Selectivity 10% | ACORN-1". Falls back to empty.
-    auto mode_from_label = [](std::string const& lbl) -> std::string {
-        auto p = lbl.rfind(" | ");
-        return (p == std::string::npos) ? std::string{} : lbl.substr(p + 3);
-    };
+    std::cout << std::left << std::setw(14) << "Selectivity" << std::setw(11) << "Mode" << std::right << std::setw(8)
+              << "EF" << std::setw(7) << "BR" << std::setw(9) << "ET(ms)" << std::setw(12) << "Latency(ms)"
+              << std::setw(10) << "QPS"
+              << std::setw(14) << "Dist.Computed"
+              << std::setw(14) << "NodesVisited" << std::setw(10) << "Recall(avg)" << std::setw(12) << "RecallRatio"
+              << std::setw(10) << "Speedup" << std::setw(10) << "DistRatio" << std::setw(12) << "PredEvals";
+    if (early_termination_enabled())
+        std::cout << std::setw(12) << "EarlyTerm";
+    std::cout << "\n";
+    // Rule widens with the optional early-termination column.
+    std::size_t const table_width = early_termination_enabled() ? 165 : 153;
+    std::cout << std::string(table_width, '-') << "\n";
 
     // Shared row printer
     auto print_row = [&](std::string const& sel, std::string const& mode, search_result_summary_t const& r,
                          search_result_summary_t const* hnsw_baseline) {
-        std::cout << std::left << std::setw(14) << sel << std::setw(11) << mode << std::right << std::fixed
-                  << std::setprecision(1) << std::setw(12) << r.latency_ms << std::setprecision(0) << std::setw(14)
-                  << r.dist_computed << std::setw(14) << r.nodes_visited << std::setprecision(4) << std::setw(10)
-                  << r.recall;
-        if (hnsw_baseline && &r != hnsw_baseline && !r.exact) {
+        std::cout << std::left << std::setw(14) << sel << std::setw(11) << mode << std::right;
+        if (r.ef_search > 0)
+            std::cout << std::setw(8) << r.ef_search;
+        else
+            std::cout << std::setw(8) << "-";
+        if (r.bridge_budget_ratio > 0)
+            std::cout << std::fixed << std::setprecision(1) << std::setw(7) << r.bridge_budget_ratio;
+        else
+            std::cout << std::setw(7) << "-";
+        if (r.early_termination_ms >= 0)
+            std::cout << std::fixed << std::setprecision(2) << std::setw(9) << r.early_termination_ms;
+        else
+            std::cout << std::setw(9) << "-";
+        std::cout << std::fixed << std::setprecision(1) << std::setw(12) << r.latency_ms << std::setprecision(0)
+                  << std::setw(10) << r.qps << std::setw(14) << r.dist_computed << std::setw(14) << r.nodes_visited
+                  << std::setprecision(4) << std::setw(10) << r.recall;
+        if (hnsw_baseline && &r != hnsw_baseline && !r.exact && r.latency_ms > 0 && r.dist_computed > 0 &&
+            hnsw_baseline->recall > 0 && std::isfinite(r.latency_ms) && std::isfinite(r.dist_computed)) {
             double sp = hnsw_baseline->latency_ms / r.latency_ms;
             double dr = hnsw_baseline->dist_computed / r.dist_computed;
-            double rr = (hnsw_baseline->recall > 0) ? r.recall / hnsw_baseline->recall : 0.0;
+            double rr = r.recall / hnsw_baseline->recall;
             std::cout << std::setprecision(2) << std::setw(11) << rr << "x" << std::setprecision(1) << std::setw(9)
                       << sp << "x" << std::setw(9) << dr << "x";
         } else {
@@ -2208,12 +3320,8 @@ int run_benchmark(vector_store_t<float>& store, float const* query_vecs_data, st
             std::cout << std::setprecision(0) << std::setw(12) << r.predicate_evals;
         else
             std::cout << std::setw(12) << "";
-        if (r.fallback_count > 0 && !std::isnan(r.fallback_selectivity))
-            std::cout << std::setprecision(1) << std::setw(10) << r.fallback_count << std::setprecision(4)
-                      << std::setw(10) << r.fallback_selectivity;
-        else
-            std::cout << std::setw(10) << "" << std::setw(10) << "";
-        std::cout << std::setw(9) << (r.fallback_to_exact ? "YES" : "");
+        if (early_termination_enabled())
+            std::cout << std::setprecision(1) << std::setw(11) << (r.early_term_rate * 100.0) << "%";
         std::cout << "\n";
     };
 
@@ -2221,8 +3329,8 @@ int run_benchmark(vector_store_t<float>& store, float const* query_vecs_data, st
     std::size_t group_start = 0;
     if (show_baseline) {
         auto const& b = summaries[0];
-        print_row("Baseline", "NoPred", b, nullptr);
-        std::cout << std::string(148, '-') << "\n";
+        print_row("Baseline", b.mode, b, nullptr);
+        std::cout << std::string(table_width, '-') << "\n";
         group_start = 1;
     }
 
@@ -2233,10 +3341,11 @@ int run_benchmark(vector_store_t<float>& store, float const* query_vecs_data, st
         while (j < summaries.size() && std::fabs(summaries[j].selectivity - sel_val) < 1e-12)
             ++j;
 
-        // Find HNSW within [i, j) as the ratio baseline
+        // Find HNSW within [i, j) as the ratio baseline. With an ef sweep the
+        // group holds many HNSW rows at different ef, so ratios are suppressed.
         search_result_summary_t const* hnsw_p = nullptr;
-        for (std::size_t k = i; k < j; ++k) {
-            if (iequals(mode_from_label(summaries[k].label), "HNSW")) {
+        for (std::size_t k = i; k < j && !EF_VALUES_SET; ++k) {
+            if (iequals(summaries[k].mode, "HNSW")) {
                 hnsw_p = &summaries[k];
                 break;
             }
@@ -2253,15 +3362,17 @@ int run_benchmark(vector_store_t<float>& store, float const* query_vecs_data, st
 
         bool first = true;
         for (std::size_t k = i; k < j; ++k) {
-            std::string mode = mode_from_label(summaries[k].label);
-            print_row(first ? sel_str : std::string{}, mode, summaries[k], hnsw_p);
+            print_row(first ? sel_str : std::string{}, summaries[k].mode, summaries[k], hnsw_p);
             first = false;
         }
         if (j < summaries.size())
-            std::cout << std::string(148, '-') << "\n";
+            std::cout << std::string(table_width, '-') << "\n";
 
         i = j;
     }
+
+    if (!JSON_PATH.empty())
+        write_json_results(JSON_PATH, summaries);
 
     std::cout << "\n========================================================\n";
     std::cout << " Benchmark complete.\n";
@@ -2272,7 +3383,7 @@ int run_benchmark(vector_store_t<float>& store, float const* query_vecs_data, st
 // ── Main ────────────────────────────────────────────────────────────────────
 int main(int argc, char** argv) {
     // Force line/unit buffering so logs are persisted incrementally even when stdout is
-    // redirected to a file (default block-buffering hides progress until exit / SIGKILL).
+    // redirected to a file. The default block buffering hides progress until exit / SIGKILL.
     std::cout.setf(std::ios::unitbuf);
     std::cerr.setf(std::ios::unitbuf);
 
@@ -2280,17 +3391,13 @@ int main(int argc, char** argv) {
     std::cout << "========================================================\n";
     std::cout << " index_gt ACORN-1 Performance Benchmark\n";
     std::cout << "========================================================\n";
-    std::cout << "  Vectors     : " << N << "\n";
-    std::cout << "  Dimensions  : " << D << "\n";
-    std::cout << "  Connectivity: " << M << "\n";
-    std::cout << "  EF construct: " << EF_CONSTRUCTION << "\n";
-    std::cout << "  K           : " << K << "\n";
-    std::cout << "  EF search   : " << EF_SEARCH << "\n";
+    std::cout << "  Vectors     : " << N_VAL << "\n";
+    std::cout << "  Dimensions  : " << D_VAL << "\n";
+    std::cout << "  Connectivity: " << M_VAL << "\n";
+    std::cout << "  EF construct: " << EF_CONSTRUCTION_VAL << "\n";
+    std::cout << "  K           : " << K_VAL << "\n";
+    std::cout << "  EF search   : " << EF_SEARCH_VAL << "\n";
     std::cout << "  ACORN thresh: " << ACORN_THRESHOLD << "\n";
-    std::cout << "  Bridge ratio: " << BRIDGE_BUDGET_RATIO << "\n";
-#if USEARCH_ENABLE_3HOP
-    std::cout << "  3hop thresh : " << THREE_HOP_THRESHOLD << "\n";
-#endif
     std::cout << "  Metric      : " << METRIC_NAME << "\n";
     std::cout << "  Dataset     : " << DATASET_NAME << "\n";
     std::cout << "  HW threads  : " << std::thread::hardware_concurrency() << "\n";
@@ -2311,116 +3418,88 @@ int main(int argc, char** argv) {
     std::vector<float> query_vecs_data;
     std::size_t num_queries = 0;
 
-    // Load dataset
-    if (DATASET_NAME == "sift") {
+    // Load dataset. One common path driven by a per-dataset spec table; DATASET_NAME
+    // is already validated by parse_args.
+    struct dataset_spec_t {
+        char const* name;
+        char const* base_file;
+        char const* query_file;
+        bool fbin;
+        bool u8bin;
+    };
+    static dataset_spec_t const dataset_specs[] = {
+        {"sift", "sift_base.fvecs", "sift_query.fvecs", false, false},
+        {"gist", "gist_base.fvecs", "gist_query.fvecs", false, false},
+        {"text2image", "text2image-40M.fbin", "text2image-query-100K.fbin", true, false},
+        {"laion", "laion_base.fvecs", "laion_query.fvecs", false, false},
+        {"yfcc", "base.10M.u8bin", "query.public.100K.u8bin", false, true},
+    };
+
+    {
+        dataset_spec_t const* spec = nullptr;
+        for (auto const& s : dataset_specs)
+            if (DATASET_NAME == s.name) {
+                spec = &s;
+                break;
+            }
+
         std::vector<float> base_data;
         std::size_t base_count = 0, base_dims = 0;
         bool loaded = false;
 
-        std::string base_path = DATA_DIR + "/sift_base.fvecs";
+        std::string base_path = DATA_DIR + "/" + spec->base_file;
+        // Taken before the load, so that every GT path built later carries it. This also
+        // holds when the vectors come from the volume and the base file is only fingerprinted.
+        BASE_FINGERPRINT = file_fingerprint(base_path);
         {
             stopwatch_t load_timer;
-            if (load_fvecs(base_path.c_str(), base_data, base_count, base_dims)) {
-                std::cout << "Loaded SIFT base vectors from " << base_path << ": " << base_count << " x " << base_dims
-                          << "d (" << std::fixed << std::setprecision(1) << load_timer.elapsed_ms() << " ms)\n";
+            bool ok = spec->u8bin ? load_u8bin(base_path.c_str(), base_data, base_count, base_dims, N_VAL)
+                      : spec->fbin ? load_fbin(base_path.c_str(), base_data, base_count, base_dims, N_VAL)
+                                   : load_fvecs(base_path.c_str(), base_data, base_count, base_dims);
+            if (ok) {
+                std::cout << "Loaded " << spec->name << " base vectors from " << base_path << ": " << base_count
+                          << " x " << base_dims << "d (" << std::fixed << std::setprecision(1)
+                          << load_timer.elapsed_ms() << " ms)\n";
                 loaded = true;
             }
         }
 
-        if (loaded && base_dims == D && base_count >= N) {
-            if (base_count > N)
-                base_data.resize(N * D);
-            store_ptr = std::make_unique<vector_store_t<float>>(std::move(base_data), D);
-            std::cout << "Using SIFT1M dataset (" << N << " vectors, " << D << "d)\n";
-
-            std::string query_path = DATA_DIR + "/sift_query.fvecs";
-            std::size_t q_count = 0, q_dims = 0;
-            stopwatch_t load_timer;
-            if (load_fvecs(query_path.c_str(), query_vecs_data, q_count, q_dims) && q_dims == D) {
-                num_queries = q_count;
-                std::cout << "Loaded SIFT query vectors: " << q_count << " x " << q_dims << "d (" << std::fixed
-                          << std::setprecision(1) << load_timer.elapsed_ms() << " ms)\n";
-            }
-        } else {
-            if (loaded)
-                std::cerr << "SIFT dimensions/count mismatch (got " << base_dims << "d, " << base_count << " vecs)\n";
-            else
-                std::cerr << "SIFT1M fvecs not found\n";
+        if (!loaded) {
+            std::cerr << spec->name << " base file not found: " << base_path << "\n";
             return 1;
         }
-    } else if (DATASET_NAME == "gist") {
-        std::vector<float> base_data;
-        std::size_t base_count = 0, base_dims = 0;
-        bool loaded = false;
-
-        std::string base_path = DATA_DIR + "/gist_base.fvecs";
-        {
-            stopwatch_t load_timer;
-            if (load_fvecs(base_path.c_str(), base_data, base_count, base_dims)) {
-                std::cout << "Loaded GIST base vectors from " << base_path << ": " << base_count << " x " << base_dims
-                          << "d (" << std::fixed << std::setprecision(1) << load_timer.elapsed_ms() << " ms)\n";
-                loaded = true;
-            }
-        }
-
-        if (loaded && base_dims == D && base_count >= N) {
-            if (base_count > N)
-                base_data.resize(N * D);
-            store_ptr = std::make_unique<vector_store_t<float>>(std::move(base_data), D);
-            std::cout << "Using GIST1M dataset (" << N << " vectors, " << D << "d)\n";
-
-            std::string query_path = DATA_DIR + "/gist_query.fvecs";
-            std::size_t q_count = 0, q_dims = 0;
-            stopwatch_t load_timer;
-            if (load_fvecs(query_path.c_str(), query_vecs_data, q_count, q_dims) && q_dims == D) {
-                num_queries = q_count;
-                std::cout << "Loaded GIST query vectors: " << q_count << " x " << q_dims << "d (" << std::fixed
-                          << std::setprecision(1) << load_timer.elapsed_ms() << " ms)\n";
-            }
-        } else {
-            if (loaded)
-                std::cerr << "GIST dimensions/count mismatch (got " << base_dims << "d, " << base_count << " vecs)\n";
-            else
-                std::cerr << "GIST1M fvecs not found\n";
+        if (base_dims != D_VAL || base_count < N_VAL) {
+            std::cerr << spec->name << " dimensions/count mismatch (got " << base_dims << "d, " << base_count
+                      << " vecs)\n";
             return 1;
         }
-    } else if (DATASET_NAME == "text2image") {
-        std::vector<float> base_data;
-        std::size_t base_count = 0, base_dims = 0;
-        bool loaded = false;
+        if (base_count > N_VAL)
+            base_data.resize(N_VAL * D_VAL);
+        store_ptr = std::make_unique<vector_store_t<float>>(std::move(base_data), D_VAL);
 
-        std::string base_path = DATA_DIR + "/text2image-40M.fbin";
-        {
-            stopwatch_t load_timer;
-            if (load_fbin(base_path.c_str(), base_data, base_count, base_dims, N)) {
-                std::cout << "Loaded text2image base vectors from " << base_path << ": " << base_count << " x "
-                          << base_dims << "d (" << std::fixed << std::setprecision(1) << load_timer.elapsed_ms()
-                          << " ms)\n";
-                loaded = true;
-            }
+        // Random-attribute predicate: assign one uniform uint32 per key, seed-fixed
+        // and in key order, so every run (and the GT build) sees the same column.
+        if (predicate_random()) {
+            stopwatch_t attr_timer;
+            std::mt19937_64 rng(PREDICATE_SEED);
+            RANDOM_ATTR.resize(N_VAL);
+            for (std::size_t i = 0; i < N_VAL; ++i)
+                RANDOM_ATTR[i] = static_cast<std::uint32_t>(rng() >> 32);
+            std::cout << "Assigned random attributes to " << N_VAL << " keys (seed " << PREDICATE_SEED << ", "
+                      << std::fixed << std::setprecision(1) << attr_timer.elapsed_ms() << " ms)\n";
         }
+        std::cout << "Using " << spec->name << " dataset (" << N_VAL << " vectors, " << D_VAL << "d)\n";
 
-        if (loaded && base_dims == D && base_count >= N) {
-            if (base_count > N)
-                base_data.resize(N * D);
-            store_ptr = std::make_unique<vector_store_t<float>>(std::move(base_data), D);
-            std::cout << "Using text2image dataset (" << N << " vectors, " << D << "d)\n";
-
-            std::string query_path = DATA_DIR + "/text2image-query-100K.fbin";
-            std::size_t q_count = 0, q_dims = 0;
-            stopwatch_t load_timer;
-            if (load_fbin(query_path.c_str(), query_vecs_data, q_count, q_dims) && q_dims == D) {
-                num_queries = q_count;
-                std::cout << "Loaded text2image query vectors: " << q_count << " x " << q_dims << "d (" << std::fixed
-                          << std::setprecision(1) << load_timer.elapsed_ms() << " ms)\n";
-            }
-        } else {
-            if (loaded)
-                std::cerr << "text2image dimensions/count mismatch (got " << base_dims << "d, " << base_count
-                          << " vecs)\n";
-            else
-                std::cerr << "text2image fbin not found\n";
-            return 1;
+        std::string query_path = DATA_DIR + "/" + spec->query_file;
+        std::size_t q_count = 0, q_dims = 0;
+        stopwatch_t load_timer;
+        bool q_ok = spec->u8bin ? load_u8bin(query_path.c_str(), query_vecs_data, q_count, q_dims)
+                    : spec->fbin ? load_fbin(query_path.c_str(), query_vecs_data, q_count, q_dims)
+                                 : load_fvecs(query_path.c_str(), query_vecs_data, q_count, q_dims);
+        if (q_ok && q_dims == D_VAL) {
+            num_queries = q_count;
+            std::cout << "Loaded " << spec->name << " query vectors: " << q_count << " x " << q_dims << "d ("
+                      << std::fixed << std::setprecision(1) << load_timer.elapsed_ms() << " ms)\n";
         }
     }
 
@@ -2433,6 +3512,9 @@ int main(int argc, char** argv) {
     if (METRIC_NAME == "cosine")
         ret = run_benchmark<cosine_metric_t<float, vec_key_t, slot_t>>(
             *store_ptr, num_queries > 0 ? query_vecs_data.data() : nullptr, num_queries, "Cosine");
+    else if (METRIC_NAME == "ip")
+        ret = run_benchmark<ip_metric_t<float, vec_key_t, slot_t>>(
+            *store_ptr, num_queries > 0 ? query_vecs_data.data() : nullptr, num_queries, "IP");
     else
         ret = run_benchmark<l2_metric_t<float, vec_key_t, slot_t>>(
             *store_ptr, num_queries > 0 ? query_vecs_data.data() : nullptr, num_queries, "L2sq");

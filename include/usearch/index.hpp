@@ -1,7 +1,7 @@
 // Copied from: https://github.com/unum-cloud/USearch (Apache License 2.0)
-// This file is derived from the USearch project by Ash Vardanian / Unum Cloud.
-// Modified by NAVER Corp.: added ACORN-1 / RACORN-1 / RACORN-1+ filtered search
-//   paths and 3-hop expansion on top of the upstream HNSW implementation.
+// Modified by NAVER Corp.: the filtered base-layer search paths of racorn.hpp and navix.hpp, their
+//   per-query configuration and counters, the deadline gate, the atomic `max_level_`/`entry_slot_`,
+//   the `preevaluate` and `neighbor_cmp` callbacks, `pruning_free`, and `shrink_to_recent()`.
 
 /**
  *  @file       index.hpp
@@ -13,8 +13,8 @@
 #define UNUM_USEARCH_HPP
 
 #define USEARCH_VERSION_MAJOR 2
-#define USEARCH_VERSION_MINOR 24
-#define USEARCH_VERSION_PATCH 0
+#define USEARCH_VERSION_MINOR 25
+#define USEARCH_VERSION_PATCH 3
 
 // Inferring C++ version
 // https://stackoverflow.com/a/61552074
@@ -74,15 +74,6 @@
 #define USEARCH_USE_OPENMP 0
 #endif
 
-// Optional ACORN-1 3-hop expansion (mutually exclusive with racorn).
-// When 0, the 3-hop branch + helper function are excluded from the build and
-// `acorn_passed/failed_candidates` keep their original (~M^2) capacity.
-// When 1, the buffers grow to ~M^3 to hold the 3-hop pool, and the per-cycle
-// dedup set `acorn_hop_visits` (shared with 2-hop) is sized accordingly.
-#if !defined(USEARCH_ENABLE_3HOP)
-#define USEARCH_ENABLE_3HOP 0
-#endif
-
 // OS-specific includes
 #if defined(USEARCH_DEFINED_WINDOWS)
 #define _USE_MATH_DEFINES
@@ -105,6 +96,7 @@
 #include <algorithm> // `std::sort_heap`
 #include <atomic>    // `std::atomic`
 #include <bitset>    // `std::bitset`
+#include <chrono>    // `std::chrono::steady_clock`
 #include <climits>   // `CHAR_BIT`
 #include <cmath>     // `std::sqrt`
 #include <cstring>   // `std::memset`
@@ -190,12 +182,61 @@ namespace usearch {
 
 using byte_t = char;
 
+struct checked_size_result_t {
+    std::size_t value;
+    bool overflow;
+    constexpr checked_size_result_t(std::size_t value = 0, bool overflow = false) noexcept
+        : value(value), overflow(overflow) {}
+    constexpr explicit operator bool() const noexcept { return !overflow; }
+};
+
+constexpr checked_size_result_t checked_size_overflow() noexcept { return {0, true}; }
+
+constexpr checked_size_result_t checked_size_from_u64(std::uint64_t value) noexcept {
+    return value > static_cast<std::uint64_t>((std::numeric_limits<std::size_t>::max)())
+               ? checked_size_overflow()
+               : checked_size_result_t{static_cast<std::size_t>(value), false};
+}
+
+constexpr checked_size_result_t checked_add(std::size_t a, std::size_t b) noexcept {
+    return (std::numeric_limits<std::size_t>::max)() - a < b ? checked_size_overflow()
+                                                             : checked_size_result_t{a + b, false};
+}
+
+constexpr checked_size_result_t checked_mul(std::size_t a, std::size_t b) noexcept {
+    return a && b > (std::numeric_limits<std::size_t>::max)() / a ? checked_size_overflow()
+                                                                  : checked_size_result_t{a * b, false};
+}
+
+constexpr checked_size_result_t checked_mul_add_(checked_size_result_t product, std::size_t c) noexcept {
+    return product ? checked_add(product.value, c) : product;
+}
+
+constexpr checked_size_result_t checked_mul_add(std::size_t a, std::size_t b, std::size_t c) noexcept {
+    return checked_mul_add_(checked_mul(a, b), c);
+}
+
 template <std::size_t multiple_ak> std::size_t divide_round_up(std::size_t num) noexcept {
     return (num + multiple_ak - 1) / multiple_ak;
 }
 
 inline std::size_t divide_round_up(std::size_t num, std::size_t denominator) noexcept {
     return (num + denominator - 1) / denominator;
+}
+
+constexpr checked_size_result_t checked_divide_round_up(std::size_t num, std::size_t denominator) noexcept {
+    return !denominator ? checked_size_overflow()
+           : (std::numeric_limits<std::size_t>::max)() - num < denominator - 1
+               ? checked_size_overflow()
+               : checked_size_result_t{(num + denominator - 1) / denominator, false};
+}
+
+constexpr checked_size_result_t checked_round_up_(checked_size_result_t quotient, std::size_t multiple) noexcept {
+    return quotient ? checked_mul(quotient.value, multiple) : quotient;
+}
+
+constexpr checked_size_result_t checked_round_up(std::size_t num, std::size_t multiple) noexcept {
+    return checked_round_up_(checked_divide_round_up(num, multiple), multiple);
 }
 
 inline std::size_t ceil2(std::size_t v) noexcept {
@@ -210,6 +251,14 @@ inline std::size_t ceil2(std::size_t v) noexcept {
 #endif
     v++;
     return v;
+}
+
+inline checked_size_result_t checked_ceil2(std::size_t v) noexcept {
+    if (!v)
+        return checked_size_result_t{0, false};
+    if (v > (std::size_t{1} << ((sizeof(std::size_t) * CHAR_BIT) - 1)))
+        return checked_size_overflow();
+    return checked_size_result_t{ceil2(v), false};
 }
 
 /// @brief  Simply dereferencing misaligned pointers can be dangerous.
@@ -539,9 +588,12 @@ template <typename allocator_at = std::allocator<byte_t>> class bitset_gt {
         count_ = 0;
     }
 
-    bitset_gt(std::size_t capacity) noexcept
-        : slots_((compressed_slot_t*)allocator_t{}.allocate(bits_slots(capacity) * sizeof(compressed_slot_t))),
-          count_(slots_ ? bits_slots(capacity) : 0u) {
+    bitset_gt(std::size_t capacity) noexcept {
+        checked_size_result_t slots_count = checked_divide_round_up(capacity, bits_per_slot());
+        checked_size_result_t bytes =
+            slots_count ? checked_mul(slots_count.value, sizeof(compressed_slot_t)) : slots_count;
+        slots_ = bytes ? (compressed_slot_t*)allocator_t{}.allocate(bytes.value) : nullptr;
+        count_ = slots_ ? slots_count.value : 0u;
         clear();
     }
 
@@ -610,6 +662,140 @@ template <typename allocator_at = std::allocator<byte_t>> class bitset_gt {
 };
 
 using bitset_t = bitset_gt<>;
+
+/**
+ *  @brief  Cache-line-padded striped spin-lock array for concurrent graph mutations.
+ *          Maps node slots to lock stripes via Fibonacci hashing, with each stripe
+ *          occupying its own cache line to eliminate false sharing.
+ *          The number of stripes is proportional to `threads * connectivity`, not
+ *          graph size, keeping the lock array comfortably within L2/L3 cache.
+ */
+template <typename allocator_at = std::allocator<byte_t>, std::size_t cache_line_ak = 128> //
+class striped_locks_gt {
+    using allocator_t = allocator_at;
+    using byte_t = typename allocator_t::value_type;
+    static_assert(sizeof(byte_t) == 1, "Allocator must allocate separate addressable bytes");
+
+    static constexpr std::uint64_t fibonacci_k = 0x9E3779B97F4A7C15ull;
+
+    using atomic_flag_t = std::atomic<std::uint8_t>;
+    struct alignas(cache_line_ak) padded_lock_t {
+        atomic_flag_t flag{0};
+        char padding_[cache_line_ak - sizeof(atomic_flag_t)];
+    };
+    static_assert(sizeof(padded_lock_t) == cache_line_ak, "Lock stripe must be exactly one cache line");
+
+    // `padded_lock_t` is `alignas(cache_line_ak)` (128 B by default) which
+    // exceeds what a plain allocator guarantees (typically 16 B on x86-64).
+    // Rather than demanding an over-aligned allocator, we over-allocate and
+    // keep a pointer to the aligned sub-region — `raw_` is what we hand back
+    // to the allocator, `stripes_` is the aligned view used for reads/writes.
+    byte_t* raw_{};
+    std::size_t raw_bytes_{};
+    padded_lock_t* stripes_{};
+    std::size_t count_{};
+    unsigned shift_{};
+
+    inline std::size_t stripe_for_(std::size_t slot) const noexcept {
+        return static_cast<std::size_t>((static_cast<std::uint64_t>(slot) * fibonacci_k) >> shift_);
+    }
+
+  public:
+    striped_locks_gt() noexcept {}
+    ~striped_locks_gt() noexcept { reset(); }
+
+    explicit operator bool() const noexcept { return stripes_; }
+
+    void reset() noexcept {
+        if (stripes_)
+            for (std::size_t i = 0; i < count_; i++)
+                stripes_[i].~padded_lock_t();
+        if (raw_)
+            allocator_t{}.deallocate(raw_, raw_bytes_);
+        raw_ = nullptr;
+        raw_bytes_ = 0;
+        stripes_ = nullptr;
+        count_ = 0;
+        shift_ = 64;
+    }
+
+    striped_locks_gt(std::size_t threads, std::size_t connectivity) noexcept {
+        checked_size_result_t desired = checked_mul(threads, connectivity);
+        desired = desired ? checked_mul(desired.value, std::size_t{4}) : desired;
+        if (!desired) {
+            shift_ = 64;
+            return;
+        }
+
+        checked_size_result_t count = checked_ceil2((std::max<std::size_t>)(desired.value, 256));
+        if (!count) {
+            shift_ = 64;
+            return;
+        }
+        count_ = count.value;
+        shift_ = 64;
+        for (std::size_t n = count_; n > 1; n >>= 1)
+            shift_--;
+        // Request one extra stripe's worth of slack so we can always land on a
+        // `cache_line_ak`-aligned address inside the allocation, regardless of
+        // what the underlying allocator returns.
+        constexpr std::size_t alignment_k = alignof(padded_lock_t);
+        checked_size_result_t raw_bytes = checked_mul_add(count_, sizeof(padded_lock_t), alignment_k);
+        if (!raw_bytes) {
+            count_ = 0;
+            shift_ = 64;
+            return;
+        }
+        raw_bytes_ = raw_bytes.value;
+        raw_ = allocator_t{}.allocate(raw_bytes_);
+        if (!raw_) {
+            raw_bytes_ = 0;
+            count_ = 0;
+            shift_ = 64;
+            return;
+        }
+        auto raw_address = reinterpret_cast<std::uintptr_t>(raw_);
+        auto aligned_address = (raw_address + alignment_k - 1) & ~(static_cast<std::uintptr_t>(alignment_k) - 1);
+        stripes_ = reinterpret_cast<padded_lock_t*>(aligned_address);
+        for (std::size_t i = 0; i < count_; i++)
+            new (&stripes_[i]) padded_lock_t();
+    }
+
+    striped_locks_gt(striped_locks_gt&& other) noexcept {
+        raw_ = exchange(other.raw_, (byte_t*)nullptr);
+        raw_bytes_ = exchange(other.raw_bytes_, std::size_t{0});
+        stripes_ = exchange(other.stripes_, nullptr);
+        count_ = exchange(other.count_, std::size_t{0});
+        shift_ = exchange(other.shift_, unsigned{64});
+    }
+
+    striped_locks_gt& operator=(striped_locks_gt&& other) noexcept {
+        std::swap(raw_, other.raw_);
+        std::swap(raw_bytes_, other.raw_bytes_);
+        std::swap(stripes_, other.stripes_);
+        std::swap(count_, other.count_);
+        std::swap(shift_, other.shift_);
+        return *this;
+    }
+
+    striped_locks_gt(striped_locks_gt const&) = delete;
+    striped_locks_gt& operator=(striped_locks_gt const&) = delete;
+
+    inline bool atomic_set(std::size_t i) noexcept {
+        return stripes_[stripe_for_(i)].flag.exchange(1, std::memory_order_acquire);
+    }
+
+    inline void atomic_reset(std::size_t i) noexcept {
+        stripes_[stripe_for_(i)].flag.store(0, std::memory_order_release);
+    }
+
+    inline void lock(std::size_t i) noexcept {
+        while (atomic_set(i))
+            std::this_thread::yield();
+    }
+
+    inline void unlock(std::size_t i) noexcept { atomic_reset(i); }
+};
 
 /**
  *  @brief  Similar to `std::priority_queue`, but allows raw access to underlying
@@ -742,11 +928,17 @@ class max_heap_gt {
      */
     usearch_profiled_m bool reserve(std::size_t new_capacity) noexcept {
         usearch_profile_name_m(max_heap_reserve);
-        if (new_capacity < capacity_)
+        if (new_capacity <= capacity_)
             return true;
 
-        new_capacity = ceil2(new_capacity);
-        new_capacity = (std::max<std::size_t>)(new_capacity, (std::max<std::size_t>)(capacity_ * 2u, 16u));
+        checked_size_result_t rounded_capacity = checked_ceil2(new_capacity);
+        if (!rounded_capacity)
+            return false;
+        checked_size_result_t doubled_capacity = checked_mul(capacity_, std::size_t{2});
+        if (!doubled_capacity)
+            return false;
+        new_capacity =
+            (std::max<std::size_t>)(rounded_capacity.value, (std::max<std::size_t>)(doubled_capacity.value, 16u));
         auto allocator = allocator_t{};
         auto new_elements = allocator.allocate(new_capacity);
         if (!new_elements)
@@ -908,11 +1100,17 @@ class sorted_buffer_gt {
     inline void clear() noexcept { size_ = 0; }
 
     bool reserve(std::size_t new_capacity) noexcept {
-        if (new_capacity < capacity_)
+        if (new_capacity <= capacity_)
             return true;
 
-        new_capacity = ceil2(new_capacity);
-        new_capacity = (std::max<std::size_t>)(new_capacity, (std::max<std::size_t>)(capacity_ * 2u, 16u));
+        checked_size_result_t rounded_capacity = checked_ceil2(new_capacity);
+        if (!rounded_capacity)
+            return false;
+        checked_size_result_t doubled_capacity = checked_mul(capacity_, std::size_t{2});
+        if (!doubled_capacity)
+            return false;
+        new_capacity =
+            (std::max<std::size_t>)(rounded_capacity.value, (std::max<std::size_t>)(doubled_capacity.value, 16u));
         auto allocator = allocator_t{};
         auto new_elements = allocator.allocate(new_capacity);
         if (!new_elements)
@@ -1027,8 +1225,10 @@ class usearch_pack_m uint40_t {
         return result;
     }
 
-    inline static uint40_t max() noexcept { return uint40_t{}.broadcast(0xFF); }
-    inline static uint40_t min() noexcept { return uint40_t{}.broadcast(0); }
+    /* Parenthesized declarator keeps MSVC's preprocessor from expanding
+     * `max` / `min` against `<windows.h>`'s `max(a,b)` / `min(a,b)` macros. */
+    inline static uint40_t(max)() noexcept { return uint40_t{}.broadcast(0xFF); }
+    inline static uint40_t(min)() noexcept { return uint40_t{}.broadcast(0); }
 
     inline bool operator==(uint40_t const& other) const noexcept { return std::memcmp(octets, other.octets, 5) == 0; }
     inline bool operator!=(uint40_t const& other) const noexcept { return !(*this == other); }
@@ -1060,7 +1260,7 @@ template <typename element_at> struct default_free_value_gt {
     template <typename sfinae_element_at = element_at,
               typename std::enable_if<std::is_integral<sfinae_element_at>::value>::type* = nullptr>
     static sfinae_element_at value() noexcept {
-        return std::numeric_limits<element_at>::max();
+        return (std::numeric_limits<element_at>::max)();
     }
     template <typename sfinae_element_at = element_at,
               typename std::enable_if<!std::is_integral<sfinae_element_at>::value>::type* = nullptr>
@@ -1070,7 +1270,7 @@ template <typename element_at> struct default_free_value_gt {
 };
 
 template <> struct default_free_value_gt<uint40_t> {
-    static uint40_t value() noexcept { return uint40_t::max(); }
+    static uint40_t value() noexcept { return (uint40_t::max)(); }
 };
 
 template <typename element_at> element_at default_free_value() { return default_free_value_gt<element_at>::value(); }
@@ -1112,6 +1312,8 @@ class growing_hash_set_gt {
     std::size_t capacity_{};
     /// @brief Number of populated.
     std::size_t count_{};
+    /// @brief Decayed peak of the populated counts seen by `shrink_to_recent()`.
+    std::size_t peak_{};
     hasher_t hasher_{};
 
   public:
@@ -1120,6 +1322,7 @@ class growing_hash_set_gt {
 
     explicit operator bool() const noexcept { return slots_; }
     std::size_t size() const noexcept { return count_; }
+    std::size_t capacity() const noexcept { return capacity_; }
 
     void clear() noexcept {
         if (slots_)
@@ -1135,9 +1338,32 @@ class growing_hash_set_gt {
         count_ = 0;
     }
 
-    growing_hash_set_gt(std::size_t capacity) noexcept
-        : slots_((element_t*)allocator_t{}.allocate(ceil2(capacity) * sizeof(element_t))),
-          capacity_(slots_ ? ceil2(capacity) : 0u), count_(0u) {
+    /**
+     *  @brief  Drops the table when it is far larger than what the recent queries of this set
+     *          needed. Call once per query, before `clear()`, while `size()` still holds the
+     *          previous query's count.
+     *
+     *  `reserve()` never shrinks and `clear()` wipes the whole capacity, so without this one
+     *  query that visited millions of nodes (HNSW in-filtering at low selectivity and large ef)
+     *  leaves every later query on the same thread paying a multi-megabyte memset before any
+     *  work — a fixed cost set by process history, not by the query. A fixed size cap removes
+     *  that cost but makes a run of huge queries re-fault a table of millions of slots on every
+     *  query. So the peak count decays geometrically (1/16 per query): a run of big queries
+     *  keeps its table, and a few dozen small queries after a big one — fewer than one
+     *  benchmark warm-up pass — bring the table back to their own size.
+     */
+    void shrink_to_recent(std::size_t min_capacity = std::size_t{1} << 15) noexcept {
+        peak_ = (std::max)(count_, peak_ - (peak_ >> 4));
+        std::size_t want = peak_ + (peak_ >> 1); // the 5/3 load factor of reserve(), rounded down
+        if (capacity_ > min_capacity && (capacity_ >> 3) > want)
+            reset();
+    }
+
+    growing_hash_set_gt(std::size_t capacity) noexcept : count_(0u) {
+        checked_size_result_t slots_count = checked_ceil2(capacity);
+        checked_size_result_t bytes = slots_count ? checked_mul(slots_count.value, sizeof(element_t)) : slots_count;
+        slots_ = bytes ? (element_t*)allocator_t{}.allocate(bytes.value) : nullptr;
+        capacity_ = slots_ ? slots_count.value : 0u;
         clear();
     }
 
@@ -1195,12 +1421,21 @@ class growing_hash_set_gt {
      *  @return `true` if enough capacity is available, `false` if memory allocation failed.
      */
     bool reserve(std::size_t new_capacity) noexcept {
-        new_capacity = (new_capacity * 5u) / 3u;
+        checked_size_result_t scaled_capacity = checked_mul(new_capacity, std::size_t{5});
+        if (!scaled_capacity)
+            return false;
+        new_capacity = scaled_capacity.value / 3u;
         if (new_capacity <= capacity_)
             return true;
 
-        new_capacity = ceil2(new_capacity);
-        element_t* new_slots = (element_t*)allocator_t{}.allocate(new_capacity * sizeof(element_t));
+        checked_size_result_t rounded_capacity = checked_ceil2(new_capacity);
+        if (!rounded_capacity)
+            return false;
+        new_capacity = rounded_capacity.value;
+        checked_size_result_t new_bytes = checked_mul(new_capacity, sizeof(element_t));
+        if (!new_bytes)
+            return false;
+        element_t* new_slots = (element_t*)allocator_t{}.allocate(new_bytes.value);
         if (!new_slots)
             return false;
 
@@ -1226,7 +1461,9 @@ class growing_hash_set_gt {
     }
 };
 
-// gen_hash_set_gt + stride_downsample_inplace — used only by the RACORN search path.
+// Utilities of the ACORN-1 / RACORN-1 / NaviX search paths (`gen_hash_set_gt`,
+// `stride_downsample_inplace`). They are kept in their own header. It is included
+// here, at namespace scope, because they depend on the helpers above.
 #include "racorn_util.hpp"
 
 /**
@@ -1306,7 +1543,10 @@ class ring_gt {
             return false; // prevent data loss
         if (n <= capacity())
             return true;
-        n = (std::max<std::size_t>)(ceil2(n), 64u);
+        checked_size_result_t rounded_capacity = checked_ceil2(n);
+        if (!rounded_capacity)
+            return false;
+        n = (std::max<std::size_t>)(rounded_capacity.value, 64u);
         element_t* elements = allocator_.allocate(n);
         if (!elements)
             return false;
@@ -1335,8 +1575,7 @@ class ring_gt {
     bool try_push(element_t const& value) noexcept {
         if (head_ == tail_ && !empty_)
             return false; // `elements_` is full
-
-        return push(value);
+        push(value);
         return true;
     }
 
@@ -1386,6 +1625,13 @@ struct index_config_t {
     /// > It is called `M0` in the paper.
     std::size_t connectivity_base = default_connectivity() * 2;
 
+    /// @brief Skips the diversity ("Relative Neighborhood Graph") pruning heuristic
+    /// during construction and keeps the nearest candidates instead. This is the
+    /// "original HNSW index without pruning" construction that the ACORN paper
+    /// (SIGMOD 2024, Section 5.3) prescribes for ACORN-1. Build-time only: the
+    /// flag is not serialized, and search over a loaded index is unaffected.
+    bool pruning_free = false;
+
     inline index_config_t() = default;
     inline index_config_t(std::size_t c, std::size_t cb = 0) noexcept : connectivity(c), connectivity_base(cb) {}
 
@@ -1396,12 +1642,22 @@ struct index_config_t {
     inline error_t validate() noexcept {
         if (connectivity == 0)
             connectivity = default_connectivity();
-        if (connectivity_base == 0)
-            connectivity_base = connectivity * 2;
+        if (connectivity_base == 0) {
+            checked_size_result_t default_base = checked_mul(connectivity, std::size_t{2});
+            if (!default_base)
+                return "Connectivity is too large";
+            connectivity_base = default_base.value;
+        }
         if (connectivity < 2)
             return "Connectivity must be at least 2, otherwise the index degenerates into ropes";
         if (connectivity_base < connectivity)
             return "Base layer should be at least as connected as the rest of the graph";
+        checked_size_result_t neighbors_bytes =
+            checked_mul_add(connectivity, sizeof(std::uint64_t), sizeof(std::uint32_t));
+        checked_size_result_t neighbors_base_bytes =
+            checked_mul_add(connectivity_base, sizeof(std::uint64_t), sizeof(std::uint32_t));
+        if (!neighbors_bytes || !neighbors_base_bytes)
+            return "Connectivity is too large";
         return {};
     }
 
@@ -1413,24 +1669,47 @@ struct index_config_t {
 };
 
 /**
+ *  @brief  Tag type selecting the "no upfront reservation" overload of
+ *          @ref index_limits_t.  Modeled after @c std::defer_lock: the
+ *          resulting limits are all-zero and produce no allocations when
+ *          handed to @ref index_dense_gt::try_reserve.
+ */
+struct unreserved_t {};
+constexpr unreserved_t unreserved{};
+
+/**
  *  @brief  Growth settings for the index container.
  *          Includes the upper bound for `::members` capacity,
  *          and the number of read/write threads expected to work with the index.
  */
 struct index_limits_t {
     /// @brief Maximum number of entries in the index.
-    std::size_t members = 0;
+    std::size_t members;
     /// @brief Max number of threads simultaneously updating entries.
-    std::size_t threads_add = std::thread::hardware_concurrency();
+    std::size_t threads_add;
     /// @brief Max number of threads simultaneously searching entries.
-    std::size_t threads_search = std::thread::hardware_concurrency();
+    std::size_t threads_search;
 
     inline index_limits_t(std::size_t n, std::size_t t) noexcept : members(n), threads_add(t), threads_search(t) {}
-    inline index_limits_t(std::size_t n = 0) noexcept : index_limits_t(n, std::thread::hardware_concurrency()) {}
+    inline index_limits_t(std::size_t n = 0) noexcept
+        : index_limits_t(n, (std::max<std::size_t>)(1, std::thread::hardware_concurrency())) {}
+    inline index_limits_t(unreserved_t) noexcept : members(0), threads_add(0), threads_search(0) {}
     /// @brief Returns the upper limit for the number of threads.
     inline std::size_t threads() const noexcept { return (std::max)(threads_add, threads_search); }
     /// @brief Returns the concurrency-level of the index - the minimum of thread counts.
     inline std::size_t concurrency() const noexcept { return (std::min)(threads_add, threads_search); }
+    /// @brief Returns a copy with zero thread counts replaced by the library default.
+    ///        Use when carrying limits forward across operations that may have left
+    ///        @c threads_add / @c threads_search unset (e.g. @c unreserved construction).
+    inline index_limits_t with_thread_defaults() const noexcept {
+        index_limits_t result = *this;
+        index_limits_t const defaults;
+        if (!result.threads_add)
+            result.threads_add = defaults.threads_add;
+        if (!result.threads_search)
+            result.threads_search = defaults.threads_search;
+        return result;
+    }
 };
 
 struct index_update_config_t {
@@ -1455,43 +1734,106 @@ struct index_search_config_t {
     /// @brief Brute-forces exhaustive search over all entries in the index.
     bool exact = false;
 
-    /// @brief ACORN-1 two-hop expansion threshold. When >= 0, enables adaptive
-    /// neighbor expansion during filtered search. A value of -1 disables it.
-    double two_hop_threshold = -1;
+    /// @brief Filter-first threshold for the ACORN-1 vs HNSW dispatch.
+    ///
+    /// Controls the entry-time decision in `search_to_find_in_base_`:
+    ///   * `>= 1.0`        : always run ACORN-1 (skip the probe ratio).
+    ///   * `< 0.0`         : always run plain HNSW (skip the probe ratio).
+    ///   * `[0.0, 1.0)`    : probe the 1-hop + 2-hop neighborhood of the
+    ///                       base-level entry node and measure the filter pass
+    ///                       ratio (with `preevaluate` priming). Run HNSW when
+    ///                       the ratio exceeds the threshold; otherwise run
+    ///                       ACORN-1. The probe does NOT touch next/top/visits.
+    ///                       `0.0` therefore selects ACORN-1 only when nothing
+    ///                       around the entry passes the filter. That ratio is
+    ///                       reachable at very low selectivity.
+    /// Effective only when the search predicate is non-dummy; otherwise HNSW
+    /// is always selected.
+    double filter_first_threshold = -1.0;
 
-    /// @brief RACORN-1 extensions: stride-sampling of 2-hop passed candidates
-    /// and bridge-node fallback (insertion of failed 2-hop candidates) when
-    /// `passed_2hop < one_hop_count * bridge_budget_ratio`. Requires
-    /// two_hop_threshold >= 0 to have effect.
-    bool racorn = false;
+    /// @brief RACORN-1 bridge budget ratio. The per-cycle bridge budget is
+    /// `one_hop_count * bridge_budget_ratio`. The default 0.0 disables RACORN-1
+    /// entirely (plain ACORN-1). Any value `> 0.0` enables the bridge-budget
+    /// fallback path. On cycles where the 2-hop expansion returns too few
+    /// passing candidates, a stride-sampled subset of the 2-hop failed slots is
+    /// inserted into `next`. The traversal can then continue through
+    /// filter-failed nodes. Larger values explore more aggressively. The 2-hop
+    /// branches ALWAYS collect the failed pool. The no-op for plain ACORN-1
+    /// comes from the call-site `> 0.0` guard, not from an empty pool.
+    double bridge_budget_ratio = 0.0;
 
-    /// @brief RACORN-1 bridge budget ratio. Scales the per-cycle bridge budget
-    /// as `one_hop_count * bridge_budget_ratio`. Default 1.0 matches one-to-one
-    /// with local neighborhood; lower values reduce bridge count, higher values
-    /// explore more aggressively. Only used when racorn is enabled.
-    double bridge_budget_ratio = 1.0;
+    /// @brief Stride sampling toggle for the two budget-bounded selections in
+    /// the ACORN-1/RACORN-1 2-hop path: the 2-hop passed cap and the RACORN-1
+    /// bridge pool. `true` (default) spreads the selection across the whole
+    /// pool via `stride_downsample_inplace`. `false` falls back to prefix
+    /// truncation (keep the head, drop the tail), which is the ablation
+    /// baseline. The pool is laid out as per-1-hop-neighbor blocks, so a
+    /// prefix is biased toward the first few 1-hop directions.
+    bool stride_sampling = true;
 
-    /// @brief Optional 3-hop expansion threshold. When >= 0 (and racorn is OFF),
-    /// triggers 3-hop expansion when `passed_2hop < connectivity_base * three_hop_threshold`.
-    /// Mutually exclusive with `racorn` (else-if branch in the search loop).
-    /// A value of -1 disables it.
-    double three_hop_threshold = -1;
+    /// @brief NaviX (VLDB 2025) heuristic selector. The NaviX filtered-search
+    /// heuristics are reimplemented on this library's base-layer loop, so
+    /// the pure algorithms can be compared on identical graphs. 0 disables.
+    ///   1 = onehop-s, 2 = blind, 3 = directed. Adaptive-local (a
+    ///   per-candidate switch by local selectivity) comes in two forms:
+    ///   8 = the authors' Kuzu artifact (navixFilteredSearch; the benchmark's
+    ///       navix-local), 5 = the NaviX paper's text (thresholds ub=0.5, lf=3).
+    ///   navix.hpp defines each form.
+    /// When non-zero, this overrides the filter-first/ACORN dispatch. Predicate-
+    /// failing nodes act as 2-hop conduits only and never enter the candidate
+    /// queue (contrast: RACORN-1 bridges).
+    std::size_t navix_heuristic = 0;
 
-    /// @brief RACORN-1+ adaptive exact-search threshold. When > 0 and `racorn`
-    /// is enabled, the search switches to a brute-force `search_exact_` once
-    /// the observed bridge-fallback selectivity (`fallback_passed /
-    /// fallback_evaluated`) drops to or below this value AND at least
-    /// `top_limit/2` fallback cycles have been observed (warm-up window).
-    /// Set to 0 to keep plain RACORN-1 behavior.
-    double fallback_exact_threshold = 0.0;
+    /// @brief ACORN-1 third-hop expansion trigger. 0.0 disables it; the ACORN
+    /// loop consults it only when positive.
+    ///
+    /// When `> 0.0`: a cycle whose 2-hop expansion produced fewer than
+    /// `connectivity_base * three_hop_threshold` predicate-passing candidates
+    /// walks the predicate-failing 2-hop nodes one level deeper. It promotes the
+    /// passing 3-hop neighbors it finds. Failing nodes stay conduits: they are
+    /// neither distance-computed nor inserted into the candidate queue. This is
+    /// the defining contrast with RACORN-1 bridges, which are admitted to the
+    /// frontier and can chain indefinitely. Intended as an ablation of the
+    /// expansion-depth axis on plain ACORN-1 (`bridge_budget_ratio == 0`).
+    double three_hop_threshold = 0.0;
 
-    /// @brief RACORN-1 stride down-sampling toggle. Default true. When false,
-    /// the 2-hop passed compaction (in `acorn_expand_two_hop_`) and the
-    /// 2-hop failed bridge pool (in `racorn_fallback_`) skip the stride pass
-    /// and use the head of each list directly. Useful for ablation: leaves
-    /// the bridge fallback path intact while removing the spread-sampling
-    /// behavior. Only meaningful when `racorn` is true.
-    bool racorn_stride_sampling = true;
+    /// @brief Soft time budget for the base-layer traversal.
+    ///
+    ///   * negative (default) : disabled. The traversal runs to its natural end.
+    ///   * `>= 0`             : once the budget is spent, stop the base-layer
+    ///                          traversal at the next checkpoint, provided the
+    ///                          result heap already holds `expansion`
+    ///                          candidates.
+    ///
+    /// This is a @b soft threshold, not a hard timeout. A query whose result
+    /// heap is still underfilled keeps searching past the budget. The remaining
+    /// work of the cycle in flight is always finished. Only the base-layer
+    /// traversal is timed; the upper-layer descent and the final sort and shrink
+    /// of the results are not. Never applied to exact search.
+    ///
+    /// A negative duration is the disabled value, rather than an extra flag or
+    /// an optional, to keep this header compilable as C++11. Zero is @b not the
+    /// disabled value: it is a budget that is always already spent.
+    ///
+    /// Whether a query actually stopped early is reported by
+    /// `search_result_t::early_terminated`.
+    std::chrono::duration<double> early_termination_time_threshold{-1};
+
+    /// @brief  How many results the heap must hold before the soft budget may
+    ///         stop the traversal. Zero (the default) means `expansion`: the
+    ///         budget can only shorten a search that already holds ef candidates.
+    ///         Setting it to k makes the budget the sole stopping rule beyond
+    ///         k results. This is the iso-latency comparison mode: every arm is
+    ///         given the same wall-clock time and judged on recall. Values above
+    ///         `expansion` are clamped to it. Ignored while the budget is off.
+    std::size_t early_termination_min_results = 0;
+
+    /// @brief  Copy the result heap `W` on the first base-layer cycle that begins with `W` full.
+    ///         That is the instant `search_result_t::prefill_ms` records. The caller can then
+    ///         score the results the search held when it first reached `expansion` entries
+    ///         (`search_result_t::fill_at`). Off by default; when on, one copy of `expansion`
+    ///         entries per query. Counts and results are the same either way.
+    bool fill_snapshot = false;
 };
 
 struct index_cluster_config_t {
@@ -1581,6 +1923,45 @@ struct dummy_prefetch_t {
 };
 
 /**
+ *  @brief  An example of what a USearch-compatible predicate preevaluation callback should look like.
+ *
+ *  A preevaluate callback receives a batch of distance-qualified candidates and primes
+ *  a shared cache so that subsequent per-element `predicate` calls become cheap lookups.
+ *  This enables batching external I/O (e.g. freshness checks against a postings list)
+ *  while keeping the `predicate` interface unchanged.
+ *
+ *  The received iterators support `get_slot`, `get_key`, and `.key()` operations.
+ *
+ *  @code
+ *      struct my_filter {
+ *          std::unordered_map<compressed_slot_t, bool> cache;
+ *
+ *          template <typename member_citerator_like_at>
+ *          void preevaluate(member_citerator_like_at begin,
+ *                           member_citerator_like_at end) {
+ *              cache.clear();
+ *              std::vector<key_t> keys;
+ *              for (auto it = begin; it != end; ++it)
+ *                  keys.push_back(get_key(it));
+ *              auto results = batch_freshness_check(keys);
+ *              std::size_t i = 0;
+ *              for (auto it = begin; it != end; ++it, ++i)
+ *                  cache[get_slot(it)] = results[i];
+ *          }
+ *
+ *          bool operator()(member_cref_t m) const {
+ *              auto it = cache.find(m.slot);
+ *              return it != cache.end() && it->second;
+ *          }
+ *      };
+ *  @endcode
+ */
+struct dummy_preevaluate_t {
+    template <typename member_citerator_like_at>
+    inline void operator()(member_citerator_like_at, member_citerator_like_at) const noexcept {}
+};
+
+/**
  *  @brief  An example of what a USearch-compatible executor (thread-pool) should look like.
  *
  *  It's expected to have `parallel(callback)` API to schedule one task per thread;
@@ -1626,17 +2007,32 @@ struct dummy_key_to_key_mapping_t {
 };
 
 /**
+ *  @brief  An example of what a USearch-compatible neighbor comparator should look like.
+ *
+ *  When a non-dummy comparator is provided to `search()`,
+ *  candidate neighbors are sorted by the comparator before being passed to
+ *  `prefetch` callbacks.
+ *  The comparator receives `member_cref_t` arguments (providing `.key` and `.slot`),
+ *  and should return `true` if the first argument should precede the second.
+ */
+struct dummy_neighbor_cmp_t {
+    template <typename member_at> constexpr bool operator()(member_at&&, member_at&&) const noexcept { return false; }
+};
+
+/**
  *  @brief  Checks if the provided object has a dummy type, emulating an interface,
  *          but performing no real computation.
  */
 template <typename object_at> static constexpr bool is_dummy() {
     using object_t = typename std::remove_all_extents<object_at>::type;
-    return std::is_same<typename std::decay<object_t>::type, dummy_predicate_t>::value || //
-           std::is_same<typename std::decay<object_t>::type, dummy_callback_t>::value ||  //
-           std::is_same<typename std::decay<object_t>::type, dummy_progress_t>::value ||  //
-           std::is_same<typename std::decay<object_t>::type, dummy_prefetch_t>::value ||  //
-           std::is_same<typename std::decay<object_t>::type, dummy_executor_t>::value ||  //
-           std::is_same<typename std::decay<object_t>::type, dummy_key_to_key_mapping_t>::value;
+    return std::is_same<typename std::decay<object_t>::type, dummy_predicate_t>::value ||          //
+           std::is_same<typename std::decay<object_t>::type, dummy_callback_t>::value ||           //
+           std::is_same<typename std::decay<object_t>::type, dummy_progress_t>::value ||           //
+           std::is_same<typename std::decay<object_t>::type, dummy_prefetch_t>::value ||           //
+           std::is_same<typename std::decay<object_t>::type, dummy_executor_t>::value ||           //
+           std::is_same<typename std::decay<object_t>::type, dummy_key_to_key_mapping_t>::value || //
+           std::is_same<typename std::decay<object_t>::type, dummy_preevaluate_t>::value ||        //
+           std::is_same<typename std::decay<object_t>::type, dummy_neighbor_cmp_t>::value;
 }
 
 template <typename, typename at> struct has_reset_gt {
@@ -2086,8 +2482,8 @@ class index_gt {
         friend inline vector_key_t get_key(member_iterator_gt const& it) noexcept { return it.key(); }
 
         // clang-format off
-        member_iterator_gt operator++(int) noexcept { member_iterator_gt copy(*this); ++(*this); return copy; }
-        member_iterator_gt operator--(int) noexcept { member_iterator_gt copy(*this); --(*this); return copy; }
+        member_iterator_gt operator++(int) noexcept { member_iterator_gt old(index_, slot_); ++(*this); return old; }
+        member_iterator_gt operator--(int) noexcept { member_iterator_gt old(index_, slot_); --(*this); return old; }
         member_iterator_gt operator+(difference_type d) noexcept { return member_iterator_gt(index_, static_cast<compressed_slot_t>(static_cast<std::size_t>(slot_) + d)); }
         member_iterator_gt operator-(difference_type d) noexcept { return member_iterator_gt(index_, static_cast<compressed_slot_t>(static_cast<std::size_t>(slot_) - d)); }
         member_iterator_gt& operator++() noexcept { slot_ = static_cast<compressed_slot_t>(static_cast<std::size_t>(slot_) + 1); return *this; }
@@ -2141,7 +2537,7 @@ class index_gt {
      */
     static constexpr std::size_t node_head_bytes_() { return sizeof(vector_key_t) + sizeof(level_t); }
 
-    using nodes_mutexes_t = bitset_gt<dynamic_allocator_t>;
+    using nodes_mutexes_t = striped_locks_gt<dynamic_allocator_t>;
 
     using visits_hash_set_t = growing_hash_set_gt<compressed_slot_t, hash_gt<compressed_slot_t>, dynamic_allocator_t>;
     using cycle_visits_hash_set_t = gen_hash_set_gt<compressed_slot_t, hash_gt<compressed_slot_t>, dynamic_allocator_t>;
@@ -2156,6 +2552,135 @@ class index_gt {
         distance_t distance;
         compressed_slot_t slot;
         inline bool operator<(candidate_t other) const noexcept { return distance < other.distance; }
+    };
+
+    /// @brief Scratch entry for the ACORN-1 2-hop expansion buffers
+    ///        (acorn_passed / acorn_failed / acorn_batch). Holds the slot only,
+    ///        half the size of candidate_t. The ACORN-1 path needs no distance
+    ///        for these entries: the distance is computed later, from the slot,
+    ///        only for the M selected. Sorts read the key via node_at_(slot).ckey().
+    struct acorn_candidate_t {
+        compressed_slot_t slot;
+    };
+
+    /// @brief Post-expansion state handed from the 2-hop branch
+    ///        (acorn_expand_two_hop_ or acorn_fill_m_passed_) to the RACORN-1
+    ///        bridge fallback. Always populated, because the branches collect
+    ///        the failed pool unconditionally. The fallback consumes it only
+    ///        when `bridge_budget_ratio > 0.0`. Canonical `acorn_failed` layout:
+    ///          [0..failed_1hop)                       = 1-hop failed (stash)
+    ///          [failed_1hop..failed_1hop+failed_2hop) = 2-hop failed (bridge pool)
+    struct acorn_bridge_state_t {
+        std::size_t failed_1hop = 0;
+        std::size_t failed_2hop = 0;
+        std::size_t passed_2hop = 0;
+        std::size_t one_hop_count = 0;
+        std::size_t total_passed_limit = 0;
+        /// @brief  true = failed pool not in neighbor_cmp order on entry (dense
+        ///         concatenates batches); false = sparse extracts in-order.
+        bool needs_failed_sort = false;
+    };
+
+    /**
+     *  @brief  Soft time budget for the base-layer traversal. It is shared by every
+     *          base-layer path (plain HNSW, ACORN-1, RACORN-1, NaviX), so a query
+     *          keeps one deadline and one cycle origin even after the path
+     *          dispatch. See `index_search_config_t::early_termination_time_threshold`
+     *          for the user-facing contract.
+     *
+     *  The clock starts at `start()`, i.e. at base-layer entry, rather than at
+     *  construction. This keeps the upper-layer descent out of the measured time.
+     */
+    class early_termination_gate_t {
+        using clock_t = std::chrono::steady_clock;
+
+      public:
+        /// @brief Default interval, in completed cycles, between two budget checks.
+        static constexpr std::size_t default_cycles_between_checks_k = 10;
+
+      private:
+        std::chrono::duration<double> threshold_{-1};
+        /// @brief The budget is only consulted every n-th completed cycle, so
+        ///        that the clock read stays off the per-cycle hot path.
+        std::size_t cycles_between_checks_ = default_cycles_between_checks_k;
+        /// @brief Result-heap fill required before the budget may fire; zero
+        ///        defers to the caller's `top_limit` (see `early_termination_min_results`).
+        std::size_t min_results_ = 0;
+        clock_t::time_point started_at_{};
+        std::size_t cycles_at_start_ = 0;
+        bool armed_ = false;
+        bool terminated_ = false;
+
+      public:
+        early_termination_gate_t() noexcept {}
+
+        /**
+         *  @param[in] threshold Soft budget; negative disables the gate.
+         *  @param[in] cycles_between_checks How many completed cycles to skip between
+         *             two budget checks. Zero is treated as one, i.e. check every cycle.
+         */
+        explicit early_termination_gate_t(std::chrono::duration<double> threshold,
+                                          std::size_t cycles_between_checks = default_cycles_between_checks_k,
+                                          std::size_t min_results = 0) noexcept
+            : threshold_(threshold), cycles_between_checks_(cycles_between_checks ? cycles_between_checks : 1),
+              min_results_(min_results) {}
+
+        /// @brief A negative budget means the feature is off. So does a NaN one,
+        ///        which never compares `>= 0`.
+        inline bool enabled() const noexcept { return threshold_.count() >= 0; }
+
+        /// @brief Completed cycles between two consecutive budget checks.
+        inline std::size_t cycles_between_checks() const noexcept { return cycles_between_checks_; }
+
+        /// @brief Start the budget. @p iteration_cycles is the thread's
+        ///        cumulative cycle counter, which keeps accumulating across
+        ///        queries. It is stored only as the origin from which this
+        ///        query's own cycle count is derived.
+        ///        An unstarted budget never terminates.
+        ///        The clock starts even with no budget, so that callers can time
+        ///        events inside the traversal (see `elapsed_ms`). Only the
+        ///        termination arming depends on the budget being enabled.
+        inline void start(std::size_t iteration_cycles) noexcept {
+            started_at_ = clock_t::now();
+            cycles_at_start_ = iteration_cycles;
+            if (!enabled())
+                return;
+            armed_ = true;
+        }
+
+        /// @brief Milliseconds since `start()`, for timing events within the
+        ///        traversal. Meaningless before `start()`.
+        inline double elapsed_ms() const noexcept {
+            return std::chrono::duration<double, std::milli>(clock_t::now() - started_at_).count();
+        }
+
+        /**
+         *  @brief  Should the base-layer traversal stop now? Call once per
+         *          cycle, after the natural termination condition.
+         *  @param[in] iteration_cycles Thread's cumulative cycle counter.
+         *  @param[in] top_size Candidates currently in the result heap.
+         *  @param[in] top_limit Candidates the result heap must hold before the
+         *             budget may cut the traversal short (`expansion`).
+         */
+        inline bool should_terminate(std::size_t iteration_cycles, std::size_t top_size,
+                                     std::size_t top_limit) noexcept {
+            if (!enabled() || !armed_)
+                return false;
+            // Cheapest tests first: both integer checks gate the clock read.
+            std::size_t const cycles = iteration_cycles - cycles_at_start_;
+            if (!cycles || cycles % cycles_between_checks_)
+                return false;
+            std::size_t const need = (min_results_ && min_results_ < top_limit) ? min_results_ : top_limit;
+            if (top_size < need)
+                return false;
+            if (clock_t::now() - started_at_ < threshold_)
+                return false;
+            terminated_ = true;
+            return true;
+        }
+
+        /// @brief Did the traversal stop on the budget rather than naturally?
+        inline bool terminated() const noexcept { return terminated_; }
     };
 
     using candidates_view_t = span_gt<candidate_t const>;
@@ -2247,7 +2772,7 @@ class index_gt {
                     misaligned_store<compressed_slot_t>(tape_ + shift(i - removed_count), slot);
                 }
             }
-            misaligned_store<neighbors_count_t>(tape_, old_count - removed_count);
+            misaligned_store<neighbors_count_t>(tape_, static_cast<neighbors_count_t>(old_count - removed_count));
             return removed_count;
         }
     };
@@ -2262,65 +2787,155 @@ class index_gt {
         top_candidates_t top_for_refine{};
         next_candidates_t next_candidates{};
         visits_hash_set_t visits{};
+        buffer_gt<candidate_t> qualifying_candidates{};
+        buffer_gt<compressed_slot_t> sorted_neighbors{};
         std::default_random_engine level_generator{};
         std::size_t iteration_cycles{};
         std::size_t computed_distances{};
         std::size_t computed_distances_in_refines{};
         std::size_t computed_distances_in_reverse_refines{};
 
-        /// @brief RACORN-1 fallback statistics.
-        std::size_t fallback_count{};
-        std::size_t fallback_evaluated{};
-        std::size_t fallback_passed{};
-
         /// @brief Number of times the user-supplied predicate has been evaluated
-        ///        on this thread. Counted across all search paths — HNSW base
-        ///        (`search_hnsw_in_base_`), ACORN-1 / RACORN-1 / 3-hop partitions,
-        ///        the start-slot guard in `search_at_layer_`, and the
+        ///        on this thread. Counted through `evaluate()` on every search
+        ///        path: the start-slot check, the entry gate and the HNSW loop of
+        ///        `search_to_find_in_base_`, the ACORN-1/RACORN-1 partitions
+        ///        (racorn.hpp), the NaviX heuristics (navix.hpp), and the
         ///        `search_exact_` linear scan. Per-query delta is reported via
         ///        `search_result_t::predicate_evaluations`.
         std::size_t predicate_evaluations{};
 
-        /// @brief ACORN-1 two-hop expansion threshold, copied from search config per query.
-        double two_hop_threshold = -1;
-        /// @brief RACORN-1 extensions enabled flag, copied from search config per query.
-        bool racorn = false;
-        /// @brief RACORN-1 bridge budget ratio, copied from search config per query.
-        double bridge_budget_ratio = 1.0;
-#if USEARCH_ENABLE_3HOP
-        /// @brief 3-hop expansion threshold, copied from search config per query.
-        double three_hop_threshold = -1;
-#endif
-        /// @brief RACORN-1+ adaptive exact-search threshold, copied from search
-        ///        config per query. > 0 enables the heuristic; 0 keeps plain
-        ///        RACORN-1 behavior.
-        double fallback_exact_threshold = 0.0;
-        /// @brief RACORN-1 stride down-sampling toggle, copied from config.
-        bool racorn_stride_sampling = true;
-        /// @brief Set when the RACORN-1+ heuristic decides exact search is
-        ///        more efficient than continuing the bridge fallback. Triggers
-        ///        a `search_exact_` dispatch in `search()`. Reset per-query.
-        bool fallback_to_exact{};
-        /// @brief Per-query snapshots used by `exact_fallback` so the threshold
-        ///        check observes only this query's fallback statistics, not the
-        ///        thread-local accumulation. Set in `search()` entry.
-        std::size_t fallback_count_before{};
-        std::size_t fallback_evaluated_before{};
-        std::size_t fallback_passed_before{};
-        // TODO(racorn-1): the ACORN-1 / RACORN-1 paths only ever read the `slot` field
-        //  of these entries; the `distance_t` half is always written as 0. Replacing the
-        //  element type with `compressed_slot_t` would cut these scratch buffers' memory
-        //  ~50% (and improve cache locality on long sweeps). Requires a slot-only
-        //  prefetch interface since prefetch callbacks currently receive candidate_t*.
-        buffer_gt<candidate_t> acorn_passed_candidates{};
-        buffer_gt<candidate_t> acorn_failed_candidates{};
-        /// @brief Per-cycle dedup hash set for ACORN expansion (2-hop and, when
-        ///        enabled, 3-hop). 2-hop seeds it with the 1-hop slots and adds
-        ///        each new 2-hop candidate; 3-hop reuses the same set without
-        ///        clearing, so 1-hop / 2-hop slots that already passed through
-        ///        this cycle are automatically excluded from the 3-hop pool.
-        ///        Generation counter keeps per-cycle clear O(1).
+        /// @brief Filter-first threshold (ACORN-1 vs HNSW dispatch), copied
+        ///        from search config per query. See
+        ///        `index_search_config_t::filter_first_threshold` for the
+        ///        threshold semantics.
+        double filter_first_threshold = -1.0;
+
+        /// @brief RACORN-1 bridge budget ratio (copied from config per query).
+        ///        `> 0.0` enables the RACORN-1 fallback path; `0.0` disables it
+        ///        (plain ACORN-1). See `index_search_config_t::bridge_budget_ratio`.
+        double bridge_budget_ratio = 0.0;
+
+        /// @brief Stride sampling toggle (copied from config per query).
+        ///        `false` selects prefix truncation at both budget-bounded
+        ///        2-hop selections. See `index_search_config_t::stride_sampling`.
+        bool stride_sampling = true;
+
+        /// @brief NaviX heuristic selector (copied from config per query).
+        ///        See `index_search_config_t::navix_heuristic`.
+        std::size_t navix_heuristic = 0;
+
+        /// @brief ACORN-1 third-hop trigger (copied from config per query).
+        ///        `0.0` disables it. See `index_search_config_t::three_hop_threshold`.
+        double three_hop_threshold = 0.0;
+
+        /// @brief RACORN-1 fallback counter. A per-thread accumulator since
+        ///        process start: the number of cycles where racorn_fallback_
+        ///        actually fired. The per-query delta is reported via
+        ///        `search_result_t::fallback_count`.
+        std::size_t fallback_count{};
+
+        /// @brief Expansion-size accounting for the base loop. Per-thread
+        ///        accumulators since process start. The per-query deltas are
+        ///        reported via the matching `search_result_t` fields, and a
+        ///        caller divides by `expansion_cycles` to get the per-cycle mean.
+        ///        `expansion_cycles` is counted on every base-layer path (HNSW,
+        ///        ACORN-1/RACORN-1, NaviX). The other fields are counted only on
+        ///        the ACORN-1/RACORN-1 path.
+        ///
+        ///        `expansion_size_sum` adds what one EXPAND returned: 1-hop
+        ///        passing plus 2-hop passing, bridges excluded
+        ///        (`acorn_bridge_state_t::total_passed_limit`). `expansion_cycles`
+        ///        counts every base-loop cycle. `expansion_empty_cycles` counts the
+        ///        subset whose EXPAND returned nothing, either because the
+        ///        candidate had no unvisited 1-hop neighbour or because none of
+        ///        the collected candidates passed the predicate. Note that
+        ///        `iteration_cycles` also counts the upper-layer descent, so only
+        ///        `expansion_cycles` composes with the per-cycle means.
+        ///        `bridge_size_sum` adds the predicate-failing slots the RACORN-1
+        ///        fallback actually inserted into the candidate queue.
+        ///        `bridge_sampled_sum` adds the slots it sampled and measured.
+        ///        The radius test rejects the difference, so the sampled figure is
+        ///        the one that accounts for distance computations. Both are 0 for
+        ///        plain ACORN-1.
+        ///        `promoted_count` adds the candidates that survived the visited-set
+        ///        dedup and were distance-computed. The gap to `expansion_size_sum`
+        ///        is the repeat-visit share.
+        std::size_t expansion_size_sum{};
+        std::size_t expansion_cycles{};
+        std::size_t expansion_empty_cycles{};
+        std::size_t bridge_size_sum{};
+        std::size_t bridge_sampled_sum{};
+        std::size_t promoted_count{};
+        /// @brief Where the base-layer loop spent its cycles and why it stopped.
+        ///        Per-thread accumulators; the matching `search_result_t` fields
+        ///        carry the per-query deltas.
+        ///
+        ///        A cycle is "prefill" when the result queue `W` still held fewer
+        ///        than `top_limit` entries as it began. So `cycles_prefill` counts
+        ///        the cycles the search ran before `W` first filled. The
+        ///        `*_prefill` sums are that phase's share of `expansion_size_sum`,
+        ///        `bridge_size_sum` and `fallback_count`. Subtract them from the
+        ///        totals for the phase after `W` filled.
+        ///
+        ///        Exactly one stop counter advances per query: `stop_queue_empty`
+        ///        when the candidate queue ran out, `stop_radius` when the stop
+        ///        rule fired (`W` full and the queue head worse than the radius),
+        ///        `stop_budget` when the deadline gate cut the traversal.
+        ///        `never_full` counts queries whose `W` never reached `top_limit`.
+        std::size_t cycles_prefill{};
+        std::size_t expand_prefill{};
+        std::size_t bridge_prefill{};
+        std::size_t fallback_prefill{};
+        std::size_t stop_queue_empty{};
+        std::size_t stop_radius{};
+        std::size_t stop_budget{};
+        std::size_t never_full{};
+        /// @brief Distance computations and predicate evaluations of the base
+        ///        loop alone (`*_base`), and the share of each spent before `W`
+        ///        filled (`*_prefill`). `computed_distances - dist_base` is the
+        ///        entry descent, which runs before the loop.
+        std::size_t dist_base{};
+        std::size_t pred_base{};
+        std::size_t dist_prefill{};
+        std::size_t pred_prefill{};
+        /// @brief Milliseconds from base-layer entry to the first cycle that
+        ///        begins with `W` full, i.e. how long the search took to reach
+        ///        `ef` results. NaN when `W` never filled; those queries are the
+        ///        `never_full` share. Unlike the counters above, this is the
+        ///        query's own value, not a running total. The caller resets it.
+        double prefill_ms{};
+        /// @brief `W` as it stood when `prefill_ms` was read, copied only when the search
+        ///        config asks for it (`fill_snapshot`): `fill_snapshot_size` entries, unordered.
+        bool fill_snapshot_on{};
+        buffer_gt<candidate_t> fill_snapshot{};
+        std::size_t fill_snapshot_size{};
+
+        // ACORN-1 2-hop scratch, entries of acorn_candidate_t (slot only; see
+        // its definition).
+        //   acorn_visited_candidates: visited 1-hop stash (dense Phase-3 source).
+        //   acorn_passed_candidates: 1-hop passed prefix + collected 2-hop pool.
+        //   acorn_failed_candidates: dense Phase-1 (1-hop failed) source, filled by the partition.
+        //   acorn_batch_candidates:  M-fill per-1hop 2-hop batch (expand_2hop_from scratch).
+        buffer_gt<acorn_candidate_t> acorn_visited_candidates{};
+        buffer_gt<acorn_candidate_t> acorn_passed_candidates{};
+        buffer_gt<acorn_candidate_t> acorn_failed_candidates{};
+        buffer_gt<acorn_candidate_t> acorn_batch_candidates{};
+        /// @brief Per-cycle dedup hash set for ACORN-1 2-hop expansion. Seeded
+        ///        with the 1-hop slots. Each new 2-hop candidate is checked and
+        ///        inserted, so duplicates within a cycle are excluded.
+        ///        A generation counter keeps the per-cycle clear O(1).
         cycle_visits_hash_set_t acorn_hop_visits{};
+
+        /// @brief Evaluate predicate and increment the per-query evaluation counter.
+        ///        Returns `true` (pass) when predicate_at is dummy, with zero overhead.
+        template <typename predicate_at, typename member_at>
+        inline bool evaluate(predicate_at&& predicate, member_at const& member) noexcept {
+            if (is_dummy<predicate_at>()) {
+                return true;
+            }
+            ++predicate_evaluations;
+            return predicate(member);
+        }
 
         /// @brief Heterogeneous distance calculation.
         template <typename value_at, typename metric_at, typename entry_at> //
@@ -2376,15 +2991,19 @@ class index_gt {
     precomputed_constants_t pre_{};
     memory_mapped_file_t viewed_file_{};
 
-    /// @brief  Controls access to `max_level_` and `entry_slot_`.
-    ///         If any thread is updating those values, no other threads can `add()` or `search()`.
+    /// @brief  Serializes updates to `max_level_` and `entry_slot_`.
+    ///         While a thread holds it to mutate those fields no other thread may mutate them concurrently.
+    ///         Readers do @b not take this mutex: both fields are `std::atomic`, so a lock-free load is
+    ///         race-free even while a writer (holding the mutex) stores. Consistent with `nodes_count_`.
     std::mutex global_mutex_{};
 
     /// @brief  The level of the top-most graph in the index. Grows as the logarithm of size, starts from zero.
-    level_t max_level_{};
+    ///         Atomic so the lock-free `max_level()` getter and search paths can read it without `global_mutex_`.
+    std::atomic<level_t> max_level_{};
 
     /// @brief  The slot in which the only node of the top-level graph is stored.
-    std::size_t entry_slot_{};
+    ///         Atomic so search paths can read it without `global_mutex_` (writes stay under the mutex).
+    std::atomic<std::size_t> entry_slot_{};
 
     using nodes_allocator_t = typename dynamic_allocator_traits_t::template rebind_alloc<node_t>;
 
@@ -2399,11 +3018,21 @@ class index_gt {
     /// @brief  Array of thread-specific buffers for temporary data.
     mutable buffer_gt<context_t, contexts_allocator_t> contexts_{};
 
+    context_t* context_or_null_(std::size_t thread) noexcept {
+        return thread < contexts_.size() ? contexts_.data() + thread : nullptr;
+    }
+
+    context_t const* context_or_null_(std::size_t thread) const noexcept {
+        return thread < contexts_.size() ? contexts_.data() + thread : nullptr;
+    }
+
   public:
     std::size_t connectivity() const noexcept { return config_.connectivity; }
     std::size_t capacity() const noexcept { return nodes_capacity_; }
     std::size_t size() const noexcept { return nodes_count_; }
-    std::size_t max_level() const noexcept { return nodes_count_ ? static_cast<std::size_t>(max_level_) : 0; }
+    std::size_t max_level() const noexcept {
+        return nodes_count_ ? static_cast<std::size_t>(max_level_.load(std::memory_order_relaxed)) : 0;
+    }
     index_config_t const& config() const noexcept { return config_; }
     index_limits_t const& limits() const noexcept { return limits_; }
     bool is_immutable() const noexcept { return bool(viewed_file_); }
@@ -2512,8 +3141,8 @@ class index_gt {
             other.nodes_[i] = other.node_make_copy_(node_bytes_(nodes_[i]));
 
         other.nodes_count_ = nodes_count_.load();
-        other.max_level_ = max_level_;
-        other.entry_slot_ = entry_slot_;
+        other.max_level_ = max_level_.load();
+        other.entry_slot_ = entry_slot_.load();
 
         // This controls nothing for now :)
         (void)config;
@@ -2531,6 +3160,114 @@ class index_gt {
     member_cref_t at(compressed_slot_t slot) const noexcept { return {nodes_[slot].ckey(), slot}; }
     member_iterator_t iterator_at(compressed_slot_t slot) noexcept { return {this, slot}; }
     member_citerator_t citerator_at(compressed_slot_t slot) const noexcept { return {this, slot}; }
+
+    /**
+     *  @brief  A read-only random-access range over the neighbors of a single
+     *          node at a single graph level. Dereferencing yields a `member_cref_t`,
+     *          so callers can chain traversals without touching internal slots.
+     *
+     *  @warning The range aliases the node's adjacency tape. It is only valid
+     *           while the index is not being mutated. Prefer immutable indexes
+     *           (see `is_immutable()`) or guarantee no concurrent `add`/`update`/
+     *           `remove` while the view is alive.
+     */
+    class neighbors_view_t {
+        index_gt const* index_{};
+        neighbors_ref_t neighbors_{nullptr};
+
+      public:
+        class const_iterator {
+            index_gt const* index_{};
+            misaligned_ptr_gt<compressed_slot_t const> position_{nullptr};
+
+          public:
+            using iterator_category = std::random_access_iterator_tag;
+            using value_type = member_cref_t;
+            using difference_type = std::ptrdiff_t;
+            using pointer = void;
+            using reference = member_cref_t;
+
+            const_iterator() noexcept = default;
+            const_iterator(index_gt const* index, misaligned_ptr_gt<compressed_slot_t const> position) noexcept
+                : index_(index), position_(position) {}
+
+            reference operator*() const noexcept {
+                compressed_slot_t slot = static_cast<compressed_slot_t>(*position_);
+                return {index_->node_at_(slot).ckey(), slot};
+            }
+            compressed_slot_t slot() const noexcept { return static_cast<compressed_slot_t>(*position_); }
+
+            // clang-format off
+            const_iterator& operator++() noexcept { ++position_; return *this; }
+            const_iterator operator++(int) noexcept { const_iterator old = *this; ++position_; return old; }
+            const_iterator& operator--() noexcept { --position_; return *this; }
+            const_iterator operator--(int) noexcept { const_iterator old = *this; --position_; return old; }
+            const_iterator& operator+=(difference_type d) noexcept { position_ = position_ + d; return *this; }
+            const_iterator& operator-=(difference_type d) noexcept { position_ = position_ - d; return *this; }
+            const_iterator operator+(difference_type d) const noexcept { return {index_, position_ + d}; }
+            const_iterator operator-(difference_type d) const noexcept { return {index_, position_ - d}; }
+            difference_type operator-(const_iterator const& other) const noexcept { return position_ - other.position_; }
+            bool operator==(const_iterator const& other) const noexcept { return position_ == other.position_; }
+            bool operator!=(const_iterator const& other) const noexcept { return position_ != other.position_; }
+            // clang-format on
+        };
+
+        using iterator = const_iterator;
+        using value_type = member_cref_t;
+        using size_type = std::size_t;
+
+        neighbors_view_t() noexcept = default;
+        neighbors_view_t(index_gt const* index, neighbors_ref_t neighbors) noexcept
+            : index_(index), neighbors_(neighbors) {}
+
+        std::size_t size() const noexcept { return index_ ? neighbors_.size() : 0; }
+        bool empty() const noexcept { return size() == 0; }
+        member_cref_t operator[](std::size_t offset) const noexcept {
+            compressed_slot_t slot = neighbors_[offset];
+            return {index_->node_at_(slot).ckey(), slot};
+        }
+        const_iterator begin() const noexcept {
+            return index_ ? const_iterator{index_, neighbors_.begin()} : const_iterator{};
+        }
+        const_iterator end() const noexcept {
+            return index_ ? const_iterator{index_, neighbors_.end()} : const_iterator{};
+        }
+        const_iterator cbegin() const noexcept { return begin(); }
+        const_iterator cend() const noexcept { return end(); }
+    };
+
+    /**
+     *  @brief  Returns a read-only range over the neighbors of the node at @p slot
+     *          in the graph @p level. Returned view is empty when @p level exceeds
+     *          the node's level.
+     */
+    neighbors_view_t neighbors(compressed_slot_t slot, std::size_t level) const noexcept {
+        node_t node = node_at_(slot);
+        if (static_cast<level_t>(level) > node.level())
+            return {};
+        return {this, neighbors_(node, static_cast<level_t>(level))};
+    }
+
+    /**
+     *  @brief  Returns a read-only range over the neighbors of the node referenced
+     *          by @p member at the graph @p level.
+     */
+    neighbors_view_t neighbors(member_citerator_t member, std::size_t level) const noexcept {
+        return neighbors(get_slot(member), level);
+    }
+
+    /**
+     *  @brief  Returns the top graph level at which the node at @p slot is present.
+     */
+    std::size_t level_of(compressed_slot_t slot) const noexcept {
+        return static_cast<std::size_t>(static_cast<level_t>(node_at_(slot).level()));
+    }
+
+    /**
+     *  @brief  Returns the top graph level at which the node referenced by @p member
+     *          is present.
+     */
+    std::size_t level_of(member_citerator_t member) const noexcept { return level_of(get_slot(member)); }
 
     dynamic_allocator_t const& dynamic_allocator() const noexcept { return dynamic_allocator_; }
     tape_allocator_t const& tape_allocator() const noexcept { return tape_allocator_; }
@@ -2586,19 +3323,23 @@ class index_gt {
         std::swap(tape_allocator_, other.tape_allocator_);
         std::swap(pre_, other.pre_);
         std::swap(viewed_file_, other.viewed_file_);
-        std::swap(max_level_, other.max_level_);
-        std::swap(entry_slot_, other.entry_slot_);
         std::swap(nodes_, other.nodes_);
         std::swap(nodes_mutexes_, other.nodes_mutexes_);
         std::swap(contexts_, other.contexts_);
 
-        // Non-atomic parts.
+        // Atomic parts: `std::atomic` is not swappable, so swap the loaded values by hand.
         std::size_t capacity_copy = nodes_capacity_;
         std::size_t count_copy = nodes_count_;
+        level_t max_level_copy = max_level_.load();
+        std::size_t entry_slot_copy = entry_slot_.load();
         nodes_capacity_ = other.nodes_capacity_.load();
         nodes_count_ = other.nodes_count_.load();
+        max_level_ = other.max_level_.load();
+        entry_slot_ = other.entry_slot_.load();
         other.nodes_capacity_ = capacity_copy;
         other.nodes_count_ = count_copy;
+        other.max_level_ = max_level_copy;
+        other.entry_slot_ = entry_slot_copy;
     }
 
     /**
@@ -2619,7 +3360,8 @@ class index_gt {
             return true;
         }
 
-        nodes_mutexes_t new_mutexes(limits.members);
+        std::size_t connectivity_max = (std::max)(config_.connectivity_base, config_.connectivity);
+        nodes_mutexes_t new_mutexes(limits.threads(), connectivity_max);
         buffer_gt<node_t, nodes_allocator_t> new_nodes(limits.members);
         buffer_gt<context_t, contexts_allocator_t> new_contexts(limits.threads());
         if (!new_nodes || !new_contexts || !new_mutexes)
@@ -2629,35 +3371,38 @@ class index_gt {
         if (nodes_)
             std::memcpy(new_nodes.data(), nodes_.data(), sizeof(node_t) * size());
 
-        // Pre-reserve the capacity for `top_for_refine`, which always contains at most one more
-        // element than the connectivity factors.
-        std::size_t connectivity_max = (std::max)(config_.connectivity_base, config_.connectivity);
+        // Per-context scratch: `top_for_refine` holds at most one more element than the
+        // connectivity factors; the ACORN-1 2-hop buffers and their per-cycle dedup set follow.
         for (std::size_t i = 0; i != new_contexts.size(); ++i) {
             if (!new_contexts[i].top_for_refine.reserve(connectivity_max + 1))
                 return false;
+            new_contexts[i].qualifying_candidates = buffer_gt<candidate_t>(config_.connectivity_base);
+            if (!new_contexts[i].qualifying_candidates)
+                return false;
+            new_contexts[i].sorted_neighbors = buffer_gt<compressed_slot_t>(config_.connectivity_base);
+            if (!new_contexts[i].sorted_neighbors)
+                return false;
 
-            std::size_t acorn_buf_size = config_.connectivity_base * (config_.connectivity_base + 1);
-#if USEARCH_ENABLE_3HOP
-            std::size_t acorn_pool_size = config_.connectivity_base * acorn_buf_size;
-#else
-            std::size_t acorn_pool_size = acorn_buf_size;
-#endif
+            std::size_t acorn_pool_size = config_.connectivity_base * (config_.connectivity_base + 1);
 
-            new_contexts[i].acorn_passed_candidates = buffer_gt<candidate_t>(acorn_pool_size);
+            new_contexts[i].acorn_visited_candidates = buffer_gt<acorn_candidate_t>(config_.connectivity_base);
+            if (!new_contexts[i].acorn_visited_candidates)
+                return false;
+            new_contexts[i].acorn_passed_candidates = buffer_gt<acorn_candidate_t>(acorn_pool_size);
             if (!new_contexts[i].acorn_passed_candidates)
                 return false;
-            new_contexts[i].acorn_failed_candidates = buffer_gt<candidate_t>(acorn_pool_size);
+            new_contexts[i].acorn_failed_candidates = buffer_gt<acorn_candidate_t>(acorn_pool_size);
             if (!new_contexts[i].acorn_failed_candidates)
                 return false;
-
-            // Single per-cycle dedup set shared by 2-hop and (when enabled)
-            // 3-hop expansion. Capacity = acorn_pool_size, which equals
-            // acorn_buf_size in non-3hop builds and grows to ~M³ when 3-hop is
-            // enabled.
-            new_contexts[i].acorn_hop_visits = cycle_visits_hash_set_t(acorn_pool_size);
-            if (!new_contexts[i].acorn_hop_visits) {
+            new_contexts[i].acorn_batch_candidates = buffer_gt<acorn_candidate_t>(config_.connectivity_base);
+            if (!new_contexts[i].acorn_batch_candidates)
                 return false;
-            }
+
+            // Per-cycle dedup set for ACORN-1 2-hop expansion. Capacity is
+            // sized to the worst-case 2-hop pool (~M^2).
+            new_contexts[i].acorn_hop_visits = cycle_visits_hash_set_t(acorn_pool_size);
+            if (!new_contexts[i].acorn_hop_visits)
+                return false;
         }
 
         limits_ = limits;
@@ -2703,7 +3448,7 @@ class index_gt {
         member_cref_t member;
         distance_t distance;
 
-        inline match_t() noexcept : member({nullptr, 0}), distance(std::numeric_limits<distance_t>::max()) {}
+        inline match_t() noexcept : member({nullptr, 0}), distance((std::numeric_limits<distance_t>::max)()) {}
 
         inline match_t(member_cref_t member, distance_t distance) noexcept : member(member), distance(distance) {}
 
@@ -2731,6 +3476,7 @@ class index_gt {
     class search_result_t {
         node_t const* nodes_{};
         top_candidates_t const* top_{};
+        candidate_t const* fill_{};
 
         friend class index_gt;
         inline search_result_t(index_gt const& index, top_candidates_t const* top) noexcept
@@ -2744,18 +3490,57 @@ class index_gt {
         /**  @brief  Number of times the distances were computed. */
         std::size_t computed_distances{};
         /**  @brief  Number of times the user predicate was evaluated for this
-         *           query (across HNSW / ACORN-1 / RACORN-1 / 3-hop / exact
-         *           paths). 0 when the search was issued without a predicate. */
+         *           query (across the HNSW, ACORN-1/RACORN-1, NaviX and exact
+         *           paths). 0 when the
+         *           search was issued without a predicate. */
         std::size_t predicate_evaluations{};
-        /**  @brief  RACORN-1 fallback count and observed selectivity at fallback points. */
+        /**  @brief  RACORN-1 fallback count for this query. See
+         *           `context_t::fallback_count` for the fire condition. */
         std::size_t fallback_count{};
-        double fallback_selectivity{};
-        /**  @brief  RACORN-1+ exact-fallback heuristic — true when the search
-         *           bailed out of RACORN-1's bridge fallback and finished the
-         *           query with `search_exact_` instead. Always `false` when
-         *           `fallback_exact_threshold == 0` (plain RACORN-1) or when
-         *           the search ran any non-RACORN path. */
-        bool fallback_to_exact{};
+        /**  @brief  Expansion-size accounting for this query, summed over the
+         *           base-layer cycles. Divide the sums by `expansion_cycles` for
+         *           the per-cycle means. `expansion_cycles` is counted on the
+         *           HNSW, ACORN-1/RACORN-1 and NaviX paths. The other five fields
+         *           stay 0 outside the ACORN-1/RACORN-1 path, and all six stay 0
+         *           on the exact path. See `context_t::expansion_size_sum` for the
+         *           definitions. */
+        std::size_t expansion_size_sum{};
+        std::size_t expansion_cycles{};
+        std::size_t expansion_empty_cycles{};
+        std::size_t bridge_size_sum{};
+        std::size_t bridge_sampled_sum{};
+        std::size_t promoted_count{};
+        /**  @brief  Phase split at the moment `W` filled, and this query's stop
+         *           reason. See `context_t::cycles_prefill`. The three stop
+         *           fields are 0/1 and exactly one of them is 1. */
+        std::size_t cycles_prefill{};
+        std::size_t expand_prefill{};
+        std::size_t bridge_prefill{};
+        std::size_t fallback_prefill{};
+        std::size_t stop_queue_empty{};
+        std::size_t stop_radius{};
+        std::size_t stop_budget{};
+        std::size_t never_full{};
+        /// @brief Base-loop distance computations and predicate evaluations and
+        ///        their pre-fill shares; see `context_t::dist_base`.
+        std::size_t dist_base{};
+        std::size_t pred_base{};
+        std::size_t dist_prefill{};
+        std::size_t pred_prefill{};
+        /**  @brief  Milliseconds from base-layer entry to the moment `W` first
+         *           held `ef` results. NaN when `W` never filled. That share is
+         *           `never_full`, so callers drop NaN rather than count it as 0. */
+        double prefill_ms{};
+        /**  @brief  Entries of `W` copied when it first filled: `expansion` of them when the
+         *           search config set `fill_snapshot` and `W` filled, 0 otherwise. `fill_at(i)`
+         *           returns them in no particular order. Valid until the next search on the
+         *           same thread context, like the results themselves. */
+        std::size_t fill_count{};
+        /**  @brief  `true` when the base-layer traversal was cut short by
+         *           `index_search_config_t::early_termination_time_threshold`.
+         *           Stays `false` for searches that ended naturally, including
+         *           every search that leaves the threshold disabled. */
+        bool early_terminated{};
         error_t error{};
 
         inline search_result_t() noexcept {}
@@ -2786,6 +3571,12 @@ class index_gt {
         inline match_t at(std::size_t i) const noexcept {
             candidate_t const* top_ordered = top_->data();
             candidate_t candidate = top_ordered[i];
+            node_t node = nodes_[candidate.slot];
+            return {member_cref_t{node.ckey(), candidate.slot}, candidate.distance};
+        }
+        /**  @brief  The i-th entry of `W` as it stood when it first filled; see `fill_count`. */
+        inline match_t fill_at(std::size_t i) const noexcept {
+            candidate_t candidate = fill_[i];
             node_t node = nodes_[candidate.slot];
             return {member_cref_t{node.ckey(), candidate.slot}, candidate.distance};
         }
@@ -2868,7 +3659,7 @@ class index_gt {
                 keys[i] = vector_key_t{};
                 distances[i] = std::numeric_limits<distance_t>::has_signaling_NaN
                                    ? std::numeric_limits<distance_t>::signaling_NaN()
-                                   : std::numeric_limits<distance_t>::max();
+                                   : (std::numeric_limits<distance_t>::max)();
             }
             return initialized_count;
         }
@@ -2923,25 +3714,35 @@ class index_gt {
      *  @param[in] config Configuration options for this specific operation.
      *  @param[in] callback On-success callback, executed while the `member_ref_t` is still under lock.
      *  @param[in] prefetch Optional prefetch callback.
+     *  @param[in] neighbor_cmp Optional comparator for sorting candidate neighbors before iteration.
      */
-    template <                                   //
-        typename value_at,                       //
-        typename metric_at,                      //
-        typename callback_at = dummy_callback_t, //
-        typename prefetch_at = dummy_prefetch_t  //
+    template <                                          //
+        typename value_at,                              //
+        typename metric_at,                             //
+        typename callback_at = dummy_callback_t,        //
+        typename prefetch_at = dummy_prefetch_t,        //
+        typename neighbor_cmp_at = dummy_neighbor_cmp_t //
         >
     add_result_t add(                                           //
         vector_key_t key, value_at&& value, metric_at&& metric, //
         index_update_config_t config = {},                      //
         callback_at&& callback = callback_at{},                 //
-        prefetch_at&& prefetch = prefetch_at{}) usearch_noexcept_m {
+        prefetch_at&& prefetch = prefetch_at{},                 //
+        neighbor_cmp_at&& neighbor_cmp = neighbor_cmp_at{}) usearch_noexcept_m {
+
+        // Zero expansion is meaningless, fall back to default
+        if (!config.expansion)
+            config.expansion = default_expansion_add();
 
         add_result_t result;
         if (is_immutable())
             return result.failed("Can't add to an immutable index");
 
         // Make sure we have enough local memory to perform this request
-        context_t& context = contexts_[config.thread];
+        context_t* context_ptr = context_or_null_(config.thread);
+        if (!context_ptr)
+            return result.failed("Reserve capacity ahead of insertions!");
+        context_t& context = *context_ptr;
         top_candidates_t& top = context.top_candidates;
         next_candidates_t& next = context.next_candidates;
         top.clear();
@@ -2958,8 +3759,8 @@ class index_gt {
 
         // Determining how much memory to allocate for the node depends on the target level
         std::unique_lock<std::mutex> new_level_lock(global_mutex_);
-        level_t max_level_copy = max_level_;                                             // Copy under lock
-        compressed_slot_t entry_slot_copy = static_cast<compressed_slot_t>(entry_slot_); // Copy under lock
+        level_t max_level_copy = max_level_;                                                    // Copy under lock
+        compressed_slot_t entry_slot_copy = static_cast<compressed_slot_t>(entry_slot_.load()); // Copy under lock
         level_t new_target_level = choose_random_level_(context.level_generator);
 
         // Make sure we are not overflowing
@@ -3000,12 +3801,12 @@ class index_gt {
         // Go down the level, tracking only the closest match
         compressed_slot_t closest_slot = search_for_one_( //
             value, metric, prefetch,                      //
-            entry_slot_copy, max_level_copy, new_target_level, context);
+            entry_slot_copy, max_level_copy, new_target_level, context, neighbor_cmp);
 
         // From `new_target_level` down - perform proper extensive search
         for (level_t level = (std::min)(new_target_level, max_level_copy); level >= 0; --level) {
             // TODO: Handle out of memory conditions
-            search_to_insert_(value, metric, prefetch, closest_slot, level, config.expansion, context);
+            search_to_insert_(value, metric, prefetch, closest_slot, level, config.expansion, context, neighbor_cmp);
             candidates_view_t closest_view;
             {
                 node_lock_t new_lock = node_lock_(new_slot);
@@ -3055,12 +3856,14 @@ class index_gt {
      *  @param[in] config Configuration options for this specific operation.
      *  @param[in] callback On-success callback, executed while the `member_ref_t` is still under lock.
      *  @param[in] prefetch Optional prefetch callback.
+     *  @param[in] neighbor_cmp Optional comparator for sorting candidate neighbors before iteration.
      */
-    template <                                   //
-        typename value_at,                       //
-        typename metric_at,                      //
-        typename callback_at = dummy_callback_t, //
-        typename prefetch_at = dummy_prefetch_t  //
+    template <                                          //
+        typename value_at,                              //
+        typename metric_at,                             //
+        typename callback_at = dummy_callback_t,        //
+        typename prefetch_at = dummy_prefetch_t,        //
+        typename neighbor_cmp_at = dummy_neighbor_cmp_t //
         >
     add_result_t update(                        //
         member_iterator_t iterator,             //
@@ -3069,7 +3872,8 @@ class index_gt {
         metric_at&& metric,                     //
         index_update_config_t config = {},      //
         callback_at&& callback = callback_at{}, //
-        prefetch_at&& prefetch = prefetch_at{}) usearch_noexcept_m {
+        prefetch_at&& prefetch = prefetch_at{}, //
+        neighbor_cmp_at&& neighbor_cmp = neighbor_cmp_at{}) usearch_noexcept_m {
 
         // Someone is gonna fuzz this, so let's make sure we cover the basics
         if (!config.expansion)
@@ -3080,7 +3884,10 @@ class index_gt {
         compressed_slot_t updated_slot = iterator.slot_;
 
         // Make sure we have enough local memory to perform this request
-        context_t& context = contexts_[config.thread];
+        context_t* context_ptr = context_or_null_(config.thread);
+        if (!context_ptr)
+            return result.failed("Reserve capacity ahead of updates!");
+        context_t& context = *context_ptr;
         top_candidates_t& top = context.top_candidates;
         next_candidates_t& next = context.next_candidates;
         top.clear();
@@ -3103,8 +3910,8 @@ class index_gt {
         compressed_slot_t entry_slot_copy;
         {
             std::unique_lock<std::mutex> new_level_lock(global_mutex_);
-            max_level_copy = max_level_;                                   // Copy under lock
-            entry_slot_copy = static_cast<compressed_slot_t>(entry_slot_); // Copy under lock
+            max_level_copy = max_level_;                                          // Copy under lock
+            entry_slot_copy = static_cast<compressed_slot_t>(entry_slot_.load()); // Copy under lock
         }
 
         // Pull stats
@@ -3120,12 +3927,12 @@ class index_gt {
                 ? entry_slot_copy
                 : search_for_one_(             //
                       value, metric, prefetch, //
-                      entry_slot_copy, max_level_copy, updated_node_level, context);
+                      entry_slot_copy, max_level_copy, updated_node_level, context, neighbor_cmp);
 
         // From `updated_node_level` down - perform proper extensive search
         for (level_t level = (std::min)(updated_node_level, max_level_copy); level >= 0; --level) {
             if (!search_to_update_(value, metric, prefetch, closest_slot, updated_slot, level, config.expansion,
-                                   context))
+                                   context, neighbor_cmp))
                 return result.failed("Out of memory!");
 
             candidates_view_t closest_view;
@@ -3162,21 +3969,28 @@ class index_gt {
      *  @param[in] config Configuration options for this specific operation.
      *  @param[in] predicate Optional filtering predicate for `member_cref_t`.
      *  @param[in] prefetch Optional prefetch callback.
+     *  @param[in] preevaluate Optional batch preevaluation callback that primes the predicate's
+     *             internal cache for a batch of distance-qualified candidates.
+     *  @param[in] neighbor_cmp Optional comparator for sorting candidate neighbors before iteration.
      *  @return Smart object referencing temporary memory. Valid until next `search()`, `add()`, or `cluster()`.
      */
-    template <                                     //
-        typename value_at,                         //
-        typename metric_at,                        //
-        typename predicate_at = dummy_predicate_t, //
-        typename prefetch_at = dummy_prefetch_t    //
+    template <                                          //
+        typename value_at,                              //
+        typename metric_at,                             //
+        typename predicate_at = dummy_predicate_t,      //
+        typename prefetch_at = dummy_prefetch_t,        //
+        typename preevaluate_at = dummy_preevaluate_t,  //
+        typename neighbor_cmp_at = dummy_neighbor_cmp_t //
         >
-    search_result_t search(                        //
-        value_at&& query,                          //
-        std::size_t wanted,                        //
-        metric_at&& metric,                        //
-        index_search_config_t config = {},         //
-        predicate_at&& predicate = predicate_at{}, //
-        prefetch_at&& prefetch = prefetch_at{}) const usearch_noexcept_m {
+    search_result_t search(                              //
+        value_at&& query,                                //
+        std::size_t wanted,                              //
+        metric_at&& metric,                              //
+        index_search_config_t config = {},               //
+        predicate_at&& predicate = predicate_at{},       //
+        prefetch_at&& prefetch = prefetch_at{},          //
+        preevaluate_at&& preevaluate = preevaluate_at{}, //
+        neighbor_cmp_at&& neighbor_cmp = neighbor_cmp_at{}) const usearch_noexcept_m {
 
         // Someone is gonna fuzz this, so let's make sure we cover the basics
         if (!wanted)
@@ -3195,38 +4009,51 @@ class index_gt {
 
         usearch_assert_m(contexts_.size() > config.thread, "Thread index out of bounds");
         context_t& context = *context_ptr;
-        context.two_hop_threshold = config.two_hop_threshold;
-        context.racorn = config.racorn;
+        context.filter_first_threshold = config.filter_first_threshold;
         context.bridge_budget_ratio = config.bridge_budget_ratio;
-#if USEARCH_ENABLE_3HOP
+        context.stride_sampling = config.stride_sampling;
+        context.navix_heuristic = config.navix_heuristic;
         context.three_hop_threshold = config.three_hop_threshold;
-#endif
-        // RACORN-1+ adaptive exact-search threshold + per-query state reset.
-        // The flag must be cleared on every entry: if a previous query on this
-        // thread tripped the heuristic and left it true, a follow-up HNSW /
-        // ACORN-1 / plain-RACORN-1 query would otherwise leak the stale value
-        // into result.fallback_to_exact.
-        context.fallback_exact_threshold = config.fallback_exact_threshold;
-        context.fallback_to_exact = false;
-        context.racorn_stride_sampling = config.racorn_stride_sampling;
+        // Every search path below starts with `visits.clear()`, which wipes the set's whole
+        // capacity; see `growing_hash_set_gt::shrink_to_recent()` for why the capacity must
+        // follow the recent queries instead of the largest query this thread ever ran.
+        context.visits.shrink_to_recent();
         top_candidates_t& top = *top_ptr;
         // Go down the level, tracking only the closest match
         result.computed_distances = context.computed_distances;
         result.visited_members = context.iteration_cycles;
-        // TODO(per-mode-metrics): snapshot of RACORN-1-only counters
-        //  (fallback_count / fallback_evaluated / fallback_passed) so the
-        //  per-query delta can be reported. Extend the same snapshot/delta
-        //  pattern to the HNSW and ACORN-1 paths so per-query stats are
-        //  collected uniformly across all search modes.
-        std::size_t fb_count_before = context.fallback_count;
-        std::size_t fb_eval_before = context.fallback_evaluated;
-        std::size_t fb_pass_before = context.fallback_passed;
-        std::size_t pred_evals_before = context.predicate_evaluations;
-        // Mirror the snapshots into the context so `exact_fallback` can compute
-        // per-query deltas without threading them through the call stack.
-        context.fallback_count_before = fb_count_before;
-        context.fallback_evaluated_before = fb_eval_before;
-        context.fallback_passed_before = fb_pass_before;
+        result.predicate_evaluations = context.predicate_evaluations;
+        result.fallback_count = context.fallback_count;
+        result.expansion_size_sum = context.expansion_size_sum;
+        result.expansion_cycles = context.expansion_cycles;
+        result.expansion_empty_cycles = context.expansion_empty_cycles;
+        result.bridge_size_sum = context.bridge_size_sum;
+        result.bridge_sampled_sum = context.bridge_sampled_sum;
+        result.promoted_count = context.promoted_count;
+        result.cycles_prefill = context.cycles_prefill;
+        result.expand_prefill = context.expand_prefill;
+        result.bridge_prefill = context.bridge_prefill;
+        result.fallback_prefill = context.fallback_prefill;
+        result.stop_queue_empty = context.stop_queue_empty;
+        result.stop_radius = context.stop_radius;
+        result.stop_budget = context.stop_budget;
+        result.never_full = context.never_full;
+        result.dist_base = context.dist_base;
+        result.pred_base = context.pred_base;
+        result.dist_prefill = context.dist_prefill;
+        result.pred_prefill = context.pred_prefill;
+        // Not a running total: cleared here so a query that never fills `W`
+        // reports NaN rather than the previous query's value.
+        context.prefill_ms = std::numeric_limits<double>::quiet_NaN();
+        context.fill_snapshot_on = config.fill_snapshot;
+        context.fill_snapshot_size = 0;
+
+        // Owned here, so the budget spans the whole base-layer traversal
+        // regardless of which path it dispatches to. It is armed inside the
+        // traversal itself. Exact search is never time-bounded.
+        early_termination_gate_t early_termination{config.early_termination_time_threshold,
+                                                   early_termination_gate_t::default_cycles_between_checks_k,
+                                                   config.early_termination_min_results};
 
         if (config.exact) {
             if (!top.reserve(wanted))
@@ -3241,22 +4068,14 @@ class index_gt {
             if (!top.reserve(expansion))
                 return result.failed("Out of memory!");
 
-            compressed_slot_t closest_slot = search_for_one_(
-                query, metric, prefetch, static_cast<compressed_slot_t>(entry_slot_), max_level_, 0, context);
+            compressed_slot_t closest_slot =
+                search_for_one_(query, metric, prefetch, static_cast<compressed_slot_t>(entry_slot_.load()), max_level_,
+                                0, context, neighbor_cmp);
 
             // For bottom layer we need a more optimized procedure
-            if (!search_to_find_in_base_(query, metric, predicate, prefetch, closest_slot, expansion, context))
+            if (!search_to_find_in_base_(query, metric, predicate, prefetch, preevaluate, neighbor_cmp, closest_slot,
+                                         expansion, context, early_termination))
                 return result.failed("Out of memory!");
-
-            // RACORN-1+: the fallback heuristic decided exact search is cheaper
-            // than continuing the bridge fallback. Discard whatever `top` has
-            // accumulated so far and replace it with the exhaustive scan.
-            if (context.fallback_to_exact) {
-                top.clear();
-                if (!top.reserve(wanted))
-                    return result.failed("Out of memory!");
-                search_exact_(query, metric, predicate, wanted, context);
-            }
         }
 
         top.sort_ascending();
@@ -3265,18 +4084,30 @@ class index_gt {
         // Normalize stats
         result.computed_distances = context.computed_distances - result.computed_distances;
         result.visited_members = context.iteration_cycles - result.visited_members;
-        result.fallback_count = context.fallback_count - fb_count_before;
-        result.fallback_to_exact = context.fallback_to_exact;
-        result.predicate_evaluations = context.predicate_evaluations - pred_evals_before;
-        {
-            std::size_t fb_eval = context.fallback_evaluated - fb_eval_before;
-            std::size_t fb_pass = context.fallback_passed - fb_pass_before;
-            // NaN signals "no fallback evaluation in this query" — distinct from
-            // a genuine selectivity of 0 (which would mean evaluations happened
-            // but none passed). Consumers should test with std::isnan().
-            result.fallback_selectivity =
-                fb_eval > 0 ? static_cast<double>(fb_pass) / static_cast<double>(fb_eval) : std::nan("");
-        }
+        result.predicate_evaluations = context.predicate_evaluations - result.predicate_evaluations;
+        result.fallback_count = context.fallback_count - result.fallback_count;
+        result.expansion_size_sum = context.expansion_size_sum - result.expansion_size_sum;
+        result.expansion_cycles = context.expansion_cycles - result.expansion_cycles;
+        result.expansion_empty_cycles = context.expansion_empty_cycles - result.expansion_empty_cycles;
+        result.bridge_size_sum = context.bridge_size_sum - result.bridge_size_sum;
+        result.bridge_sampled_sum = context.bridge_sampled_sum - result.bridge_sampled_sum;
+        result.promoted_count = context.promoted_count - result.promoted_count;
+        result.cycles_prefill = context.cycles_prefill - result.cycles_prefill;
+        result.expand_prefill = context.expand_prefill - result.expand_prefill;
+        result.bridge_prefill = context.bridge_prefill - result.bridge_prefill;
+        result.fallback_prefill = context.fallback_prefill - result.fallback_prefill;
+        result.stop_queue_empty = context.stop_queue_empty - result.stop_queue_empty;
+        result.stop_radius = context.stop_radius - result.stop_radius;
+        result.stop_budget = context.stop_budget - result.stop_budget;
+        result.never_full = context.never_full - result.never_full;
+        result.dist_base = context.dist_base - result.dist_base;
+        result.pred_base = context.pred_base - result.pred_base;
+        result.dist_prefill = context.dist_prefill - result.dist_prefill;
+        result.pred_prefill = context.pred_prefill - result.pred_prefill;
+        result.prefill_ms = context.prefill_ms; // absolute, not a delta
+        result.fill_ = context.fill_snapshot.data();
+        result.fill_count = context.fill_snapshot_size;
+        result.early_terminated = early_termination.terminated();
         result.count = top.size();
         return result;
     }
@@ -3304,6 +4135,9 @@ class index_gt {
         predicate_at&& predicate = predicate_at{}, //
         prefetch_at&& prefetch = prefetch_at{}) const noexcept {
 
+        if (!config.expansion)
+            config.expansion = default_expansion_search();
+
         context_t& context = contexts_[config.thread];
         cluster_result_t result;
         if (!nodes_count_)
@@ -3319,7 +4153,7 @@ class index_gt {
             return result.failed("Out of memory!");
 
         result.cluster.member =
-            at(search_for_one_(query, metric, prefetch, static_cast<compressed_slot_t>(entry_slot_), max_level_,
+            at(search_for_one_(query, metric, prefetch, static_cast<compressed_slot_t>(entry_slot_.load()), max_level_,
                                static_cast<level_t>(level <= 0 ? 0 : level - 1), context));
         result.cluster.distance = context.measure(query, result.cluster.member, metric);
 
@@ -3382,7 +4216,7 @@ class index_gt {
                 continue;
 
             ++result.nodes;
-            result.edges += neighbors_(node, level).size();
+            result.edges += neighbors_(node, static_cast<level_t>(level)).size();
             result.allocated_bytes += node_head_bytes_() + neighbors_bytes;
         }
 
@@ -3497,26 +4331,31 @@ class index_gt {
 
         // Progress status
         std::size_t processed = 0;
-        std::size_t const total = 2 * header.size;
+        checked_size_result_t header_size = checked_size_from_u64(header.size);
+        if (!header_size)
+            return result.failed("Index is too large to serialize");
+        checked_size_result_t total = checked_mul(std::size_t{2}, header_size.value);
+        if (!total)
+            return result.failed("Index is too large to serialize");
 
         // Export the number of levels per node
         // That is both enough to estimate the overall memory consumption,
         // and to be able to estimate the offsets of every entry in the file.
-        for (std::size_t i = 0; i != header.size; ++i) {
+        for (std::size_t i = 0; i != header_size.value; ++i) {
             node_t node = node_at_(i);
             level_t level = node.level();
             if (!output(&level, sizeof(level)))
                 return result.failed("Failed to serialize into stream");
-            if (!progress(++processed, total))
+            if (!progress(++processed, total.value))
                 return result.failed("Terminated by user");
         }
 
         // After that dump the nodes themselves
-        for (std::size_t i = 0; i != header.size; ++i) {
+        for (std::size_t i = 0; i != header_size.value; ++i) {
             span_bytes_t node_bytes = node_bytes_(node_at_(i));
             if (!output(node_bytes.data(), node_bytes.size()))
                 return result.failed("Failed to serialize into stream");
-            if (!progress(++processed, total))
+            if (!progress(++processed, total.value))
                 return result.failed("Terminated by user");
         }
 
@@ -3548,10 +4387,16 @@ class index_gt {
 
         // Allocate some dynamic memory to read all the levels
         using levels_allocator_t = typename dynamic_allocator_traits_t::template rebind_alloc<level_t>;
-        buffer_gt<level_t, levels_allocator_t> levels(header.size);
+        checked_size_result_t header_size = checked_size_from_u64(header.size);
+        if (!header_size)
+            return result.failed("Index is too large");
+        buffer_gt<level_t, levels_allocator_t> levels(header_size.value);
         if (!levels)
             return result.failed("Out of memory");
-        if (!input(levels, header.size * sizeof(level_t)))
+        checked_size_result_t levels_bytes = checked_mul(header_size.value, sizeof(level_t));
+        if (!levels_bytes)
+            return result.failed("Index is too large");
+        if (!input(levels, levels_bytes.value))
             return result.failed("Failed to pull nodes levels from the stream");
 
         // Submit metadata
@@ -3563,26 +4408,26 @@ class index_gt {
 
         pre_ = precompute_(config_);
         index_limits_t limits;
-        limits.members = header.size;
+        limits.members = header_size.value;
         limits.threads_add = (std::max<std::size_t>)(1, old_limits.threads_add);
         limits.threads_search = (std::max<std::size_t>)(1, old_limits.threads_search);
         if (!reserve(limits)) {
             reset();
             return result.failed("Out of memory");
         }
-        nodes_count_ = header.size;
+        nodes_count_ = header_size.value;
         max_level_ = static_cast<level_t>(header.max_level);
         entry_slot_ = static_cast<compressed_slot_t>(header.entry_slot);
 
         // Load the nodes
-        for (std::size_t i = 0; i != header.size; ++i) {
+        for (std::size_t i = 0; i != header_size.value; ++i) {
             span_bytes_t node_bytes = node_malloc_(levels[i]);
             if (!input(node_bytes.data(), node_bytes.size())) {
                 reset();
                 return result.failed("Failed to pull nodes from the stream");
             }
             nodes_[i] = node_t{node_bytes.data()};
-            if (!progress(i + 1, header.size))
+            if (!progress(i + 1, header_size.value))
                 return result.failed("Terminated by user");
         }
         return {};
@@ -3729,11 +4574,14 @@ class index_gt {
             reset();
             return result;
         }
+        checked_size_result_t header_size = checked_size_from_u64(header.size);
+        if (!header_size)
+            return result.failed("Index is too large");
 
         // Precompute offsets of every node, but before that we need to update the configs
         // This could have been done with `std::exclusive_scan`, but it's only available from C++17.
         using offsets_allocator_t = typename dynamic_allocator_traits_t::template rebind_alloc<std::size_t>;
-        buffer_gt<std::size_t, offsets_allocator_t> offsets(header.size);
+        buffer_gt<std::size_t, offsets_allocator_t> offsets(header_size.value);
         if (!offsets)
             return result.failed("Out of memory");
 
@@ -3745,33 +4593,47 @@ class index_gt {
 
         pre_ = precompute_(config_);
         misaligned_ptr_gt<level_t> levels{(byte_t*)file.data() + offset + sizeof(header)};
-        offsets[0u] = offset + sizeof(header) + sizeof(level_t) * header.size;
-        for (std::size_t i = 1; i < header.size; ++i)
-            offsets[i] = offsets[i - 1] + node_bytes_(levels[i - 1]);
+        checked_size_result_t levels_bytes = checked_mul(sizeof(level_t), header_size.value);
+        checked_size_result_t offset_after_header = checked_add(offset, sizeof(header));
+        checked_size_result_t first_offset = levels_bytes && offset_after_header
+                                                 ? checked_add(offset_after_header.value, levels_bytes.value)
+                                                 : checked_size_overflow();
+        if (!first_offset)
+            return result.failed("Index is too large");
+        offsets[0u] = first_offset.value;
+        for (std::size_t i = 1; i < header_size.value; ++i) {
+            checked_size_result_t next_offset = checked_add(offsets[i - 1], node_bytes_(levels[i - 1]));
+            if (!next_offset)
+                return result.failed("Index is too large");
+            offsets[i] = next_offset.value;
+        }
 
-        std::size_t total_bytes = offsets[header.size - 1] + node_bytes_(levels[header.size - 1]);
-        if (file.size() < total_bytes) {
+        checked_size_result_t total_bytes =
+            checked_add(offsets[header_size.value - 1], node_bytes_(levels[header_size.value - 1]));
+        if (!total_bytes)
+            return result.failed("Index is too large");
+        if (file.size() < total_bytes.value) {
             reset();
             return result.failed("File is corrupted and can't fit all the nodes");
         }
 
         // Submit metadata and reserve memory
         index_limits_t limits;
-        limits.members = header.size;
+        limits.members = header_size.value;
         limits.threads_add = (std::max<std::size_t>)(1, old_limits.threads_add);
         limits.threads_search = (std::max<std::size_t>)(1, old_limits.threads_search);
         if (!reserve(limits)) {
             reset();
             return result.failed("Out of memory");
         }
-        nodes_count_ = header.size;
+        nodes_count_ = header_size.value;
         max_level_ = static_cast<level_t>(header.max_level);
         entry_slot_ = static_cast<compressed_slot_t>(header.entry_slot);
 
         // Rapidly address all the nodes
-        for (std::size_t i = 0; i != header.size; ++i) {
+        for (std::size_t i = 0; i != header_size.value; ++i) {
             nodes_[i] = node_t{(byte_t*)file.data() + offsets[i]};
-            if (!progress(i + 1, header.size))
+            if (!progress(i + 1, header_size.value))
                 return result.failed("Terminated by user");
         }
         viewed_file_ = std::move(file);
@@ -3823,7 +4685,9 @@ class index_gt {
         // Progress status
         std::atomic<bool> do_tasks{true};
         std::atomic<std::size_t> processed{0};
-        std::size_t const total = 3 * slots_and_levels.size();
+        checked_size_result_t total = checked_mul(std::size_t{3}, slots_and_levels.size());
+        if (!total)
+            return;
 
         // For every bottom level node, determine its parent cluster
         executor.dynamic(slots_and_levels.size(), [&](std::size_t thread_idx, std::size_t old_slot_as_uint) {
@@ -3832,11 +4696,11 @@ class index_gt {
             compressed_slot_t cluster = search_for_one_( //
                 values[citerator_at(old_slot)],          //
                 metric, prefetch,                        //
-                static_cast<compressed_slot_t>(entry_slot_), max_level_, 0, context);
+                static_cast<compressed_slot_t>(entry_slot_.load()), max_level_, 0, context);
             slots_and_levels[old_slot] = {old_slot, cluster, node_at_(old_slot).level()};
             ++processed;
             if (thread_idx == 0)
-                do_tasks = progress(processed.load(), total);
+                do_tasks = progress(processed.load(), total.value);
             return do_tasks.load();
         });
         if (!do_tasks.load())
@@ -3870,7 +4734,7 @@ class index_gt {
                     neighbor = static_cast<compressed_slot_t>(old_slot_to_new[compressed_slot_t(neighbor)]);
 
             reordered_nodes[new_slot] = new_node;
-            if (!progress(++processed, total))
+            if (!progress(++processed, total.value))
                 return;
         }
 
@@ -3879,7 +4743,7 @@ class index_gt {
             slot_transition(node_at_(old_slot).ckey(),                //
                             static_cast<compressed_slot_t>(old_slot), //
                             static_cast<compressed_slot_t>(new_slot));
-            if (!progress(++processed, total))
+            if (!progress(++processed, total.value))
                 return;
         }
 
@@ -4004,12 +4868,11 @@ class index_gt {
     struct node_lock_t {
         nodes_mutexes_t& mutexes;
         std::size_t slot;
-        inline ~node_lock_t() noexcept { mutexes.atomic_reset(slot); }
+        inline ~node_lock_t() noexcept { mutexes.unlock(slot); }
     };
 
     inline node_lock_t node_lock_(std::size_t slot) const noexcept {
-        while (nodes_mutexes_.atomic_set(slot))
-            ;
+        nodes_mutexes_.lock(slot);
         return {nodes_mutexes_, slot};
     }
 
@@ -4017,18 +4880,17 @@ class index_gt {
         nodes_mutexes_t& mutexes;
         std::size_t slot;
         inline ~optional_node_lock_t() noexcept {
-            if (slot != std::numeric_limits<std::size_t>::max())
-                mutexes.atomic_reset(slot);
+            if (slot != (std::numeric_limits<std::size_t>::max)())
+                mutexes.unlock(slot);
         }
     };
 
     inline optional_node_lock_t optional_node_lock_(std::size_t slot, bool condition) const noexcept {
         if (condition) {
-            while (nodes_mutexes_.atomic_set(slot))
-                ;
+            nodes_mutexes_.lock(slot);
             return {nodes_mutexes_, slot};
         } else {
-            return {nodes_mutexes_, std::numeric_limits<std::size_t>::max()};
+            return {nodes_mutexes_, (std::numeric_limits<std::size_t>::max)()};
         }
     }
 
@@ -4036,8 +4898,8 @@ class index_gt {
         nodes_mutexes_t& mutexes;
         std::size_t slot;
         inline ~node_conditional_lock_t() noexcept {
-            if (slot != std::numeric_limits<std::size_t>::max())
-                mutexes.atomic_reset(slot);
+            if (slot != (std::numeric_limits<std::size_t>::max)())
+                mutexes.unlock(slot);
         }
     };
 
@@ -4045,10 +4907,10 @@ class index_gt {
                                                               bool& failed_to_acquire) const noexcept {
         if (!condition) {
             failed_to_acquire = false;
-            return {nodes_mutexes_, std::numeric_limits<std::size_t>::max()};
+            return {nodes_mutexes_, (std::numeric_limits<std::size_t>::max)()};
         }
         failed_to_acquire = nodes_mutexes_.atomic_set(slot);
-        return {nodes_mutexes_, failed_to_acquire ? std::numeric_limits<std::size_t>::max() : slot};
+        return {nodes_mutexes_, failed_to_acquire ? (std::numeric_limits<std::size_t>::max)() : slot};
     }
 
     template <typename metric_at, bool require_non_empty_ak = false>
@@ -4167,9 +5029,9 @@ class index_gt {
                               std::size_t progress) noexcept
             : index_(index), neighbors_(neighbors), visits_(visits), current_(progress) {}
         candidates_iterator_t operator++(int) noexcept {
-            candidates_iterator_t copy(*this);
+            candidates_iterator_t old(index_, neighbors_, visits_, current_);
             ++(*this);
-            return copy;
+            return old;
         }
         candidates_iterator_t& operator++() noexcept {
             ++current_;
@@ -4196,10 +5058,146 @@ class index_gt {
         candidates_iterator_t end() const noexcept { return {index, neighbors, visits, neighbors.size()}; }
     };
 
-    template <typename value_at, typename metric_at, typename prefetch_at = dummy_prefetch_t>
+    /**
+     *  @brief  Lightweight iterator over a contiguous array of `candidate_t` objects.
+     *
+     *  Provides the same `get_slot` / `get_key` / `key()` interface as `candidates_iterator_t`,
+     *  so that preevaluate and prefetch functors can operate on either iterator type
+     *  through the same generic API.
+     */
+    template <typename element_at = candidate_t> class qualifying_candidates_iterator_gt {
+        index_gt const& index_;
+        element_at const* ptr_;
+
+      public:
+        using element_t = element_at;
+        using iterator_category = std::forward_iterator_tag;
+        using value_type = element_t;
+        using difference_type = std::ptrdiff_t;
+        using pointer = element_at const*;
+        using reference = element_at const&;
+
+        qualifying_candidates_iterator_gt(index_gt const& index, element_at const* ptr) noexcept
+            : index_(index), ptr_(ptr) {}
+
+        reference operator*() const noexcept { return *ptr_; }
+
+        qualifying_candidates_iterator_gt& operator++() noexcept {
+            ++ptr_;
+            return *this;
+        }
+        qualifying_candidates_iterator_gt operator++(int) noexcept {
+            qualifying_candidates_iterator_gt tmp = *this;
+            ++ptr_;
+            return tmp;
+        }
+
+        bool operator==(qualifying_candidates_iterator_gt const& other) const noexcept { return ptr_ == other.ptr_; }
+        bool operator!=(qualifying_candidates_iterator_gt const& other) const noexcept { return ptr_ != other.ptr_; }
+
+        compressed_slot_t slot() const noexcept { return ptr_->slot; }
+        vector_key_t key() const noexcept { return index_.node_at_(ptr_->slot).key(); }
+
+        friend inline std::size_t get_slot(qualifying_candidates_iterator_gt const& it) noexcept { return it.slot(); }
+        friend inline vector_key_t get_key(qualifying_candidates_iterator_gt const& it) noexcept { return it.key(); }
+    };
+    using qualifying_candidates_iterator_t = qualifying_candidates_iterator_gt<candidate_t>;
+    using acorn_candidates_iterator_t = qualifying_candidates_iterator_gt<acorn_candidate_t>;
+
+    struct sorted_candidates_range_t;
+    /**
+     *  @brief  Lightweight iterator over a sorted contiguous array of `compressed_slot_t` values.
+     *
+     *  Similar to `candidates_iterator_t` but operates on a pre-sorted buffer of neighbor slots
+     *  rather than the raw `neighbors_ref_t`. This ensures that prefetch functors can operate
+     *  on either iterator type through the same generic API.
+     */
+    class sorted_candidates_iterator_t {
+        friend struct sorted_candidates_range_t;
+
+        index_gt const& index_;
+        compressed_slot_t const* data_;
+        std::size_t size_;
+        visits_hash_set_t& visits_;
+        std::size_t current_;
+
+        sorted_candidates_iterator_t& skip_missing() noexcept {
+            if (!visits_.size())
+                return *this;
+            while (current_ != size_) {
+                if (visits_.test(data_[current_]))
+                    current_++;
+                else
+                    break;
+            }
+            return *this;
+        }
+
+      public:
+        using element_t = compressed_slot_t;
+        using iterator_category = std::forward_iterator_tag;
+        using value_type = element_t;
+        using difference_type = std::ptrdiff_t;
+        using pointer = compressed_slot_t const*;
+        using reference = compressed_slot_t const&;
+
+        value_type operator*() const noexcept { return data_[current_]; }
+        sorted_candidates_iterator_t(index_gt const& index, compressed_slot_t const* data, std::size_t size,
+                                     visits_hash_set_t& visits, std::size_t progress) noexcept
+            : index_(index), data_(data), size_(size), visits_(visits), current_(progress) {}
+        sorted_candidates_iterator_t operator++(int) noexcept {
+            sorted_candidates_iterator_t tmp = *this;
+            ++current_;
+            skip_missing();
+            return tmp;
+        }
+        sorted_candidates_iterator_t& operator++() noexcept {
+            ++current_;
+            skip_missing();
+            return *this;
+        }
+        bool operator==(sorted_candidates_iterator_t const& other) const noexcept { return current_ == other.current_; }
+        bool operator!=(sorted_candidates_iterator_t const& other) const noexcept { return current_ != other.current_; }
+
+        vector_key_t key() const noexcept { return index_.node_at_(slot()).key(); }
+        compressed_slot_t slot() const noexcept { return data_[current_]; }
+        friend inline std::size_t get_slot(sorted_candidates_iterator_t const& it) noexcept { return it.slot(); }
+        friend inline vector_key_t get_key(sorted_candidates_iterator_t const& it) noexcept { return it.key(); }
+    };
+
+    struct sorted_candidates_range_t {
+        index_gt const& index;
+        compressed_slot_t const* data;
+        std::size_t size;
+        visits_hash_set_t& visits;
+
+        sorted_candidates_iterator_t begin() const noexcept {
+            return sorted_candidates_iterator_t{index, data, size, visits, 0}.skip_missing();
+        }
+        sorted_candidates_iterator_t end() const noexcept { return {index, data, size, visits, size}; }
+    };
+
+    template <typename neighbor_cmp_at>
+    compressed_slot_t* sort_neighbors_into_buffer_(            //
+        neighbors_ref_t neighbors, std::size_t neighbor_count, //
+        context_t& context, neighbor_cmp_at&& neighbor_cmp) const noexcept {
+        if (is_dummy<neighbor_cmp_at>())
+            return nullptr;
+        buffer_gt<compressed_slot_t>& sorted = context.sorted_neighbors;
+        for (std::size_t i = 0; i < neighbor_count; ++i)
+            sorted[i] = neighbors[i];
+        std::sort(sorted.data(), sorted.data() + neighbor_count, [&](compressed_slot_t a, compressed_slot_t b) {
+            return neighbor_cmp(member_cref_t{node_at_(a).ckey(), a}, member_cref_t{node_at_(b).ckey(), b});
+        });
+        return sorted.data();
+    }
+
+    template <typename value_at, typename metric_at, typename prefetch_at = dummy_prefetch_t,
+              typename neighbor_cmp_at = dummy_neighbor_cmp_t>
     compressed_slot_t search_for_one_(                                //
         value_at&& query, metric_at&& metric, prefetch_at&& prefetch, //
-        compressed_slot_t closest_slot, level_t begin_level, level_t end_level, context_t& context) const noexcept {
+        compressed_slot_t closest_slot, level_t begin_level, level_t end_level, context_t& context,
+        neighbor_cmp_at&& neighbor_cmp = neighbor_cmp_at{}) const noexcept {
 
         visits_hash_set_t& visits = context.visits;
         visits.clear();
@@ -4216,15 +5214,26 @@ class index_gt {
                 changed = false;
                 optional_node_lock_t closest_lock = optional_node_lock_(closest_slot, need_lock);
                 neighbors_ref_t closest_neighbors = neighbors_non_base_(node_at_(closest_slot), level);
+                std::size_t const neighbor_count = closest_neighbors.size();
+
+                compressed_slot_t* sorted_data =
+                    sort_neighbors_into_buffer_(closest_neighbors, neighbor_count, context, neighbor_cmp);
 
                 // Optional prefetching
                 if (!is_dummy<prefetch_at>()) {
-                    candidates_range_t missing_candidates{*this, closest_neighbors, visits};
-                    prefetch(missing_candidates.begin(), missing_candidates.end());
+                    if (!is_dummy<neighbor_cmp_at>()) {
+                        sorted_candidates_range_t missing{*this, sorted_data, neighbor_count, visits};
+                        prefetch(missing.begin(), missing.end());
+                    } else {
+                        candidates_range_t missing_candidates{*this, closest_neighbors, visits};
+                        prefetch(missing_candidates.begin(), missing_candidates.end());
+                    }
                 }
 
                 // Actual traversal
-                for (compressed_slot_t candidate_slot : closest_neighbors) {
+                for (std::size_t ni = 0; ni < neighbor_count; ++ni) {
+                    compressed_slot_t candidate_slot =
+                        !is_dummy<neighbor_cmp_at>() ? sorted_data[ni] : closest_neighbors[ni];
                     distance_t candidate_dist = context.measure(query, citerator_at(candidate_slot), metric);
                     if (candidate_dist < closest_dist) {
                         closest_dist = candidate_dist;
@@ -4244,10 +5253,12 @@ class index_gt {
      *          Locks the nodes in the process, assuming other threads are updating neighbors lists.
      *  @return `true` if procedure succeeded, `false` if run out of memory.
      */
-    template <typename value_at, typename metric_at, typename prefetch_at = dummy_prefetch_t>
+    template <typename value_at, typename metric_at, typename prefetch_at = dummy_prefetch_t,
+              typename neighbor_cmp_at = dummy_neighbor_cmp_t>
     bool search_to_insert_(                                           //
         value_at&& query, metric_at&& metric, prefetch_at&& prefetch, //
-        compressed_slot_t start_slot, level_t level, std::size_t top_limit, context_t& context) noexcept {
+        compressed_slot_t start_slot, level_t level, std::size_t top_limit, context_t& context,
+        neighbor_cmp_at&& neighbor_cmp = neighbor_cmp_at{}) noexcept {
 
         visits_hash_set_t& visits = context.visits;
         next_candidates_t& next = context.next_candidates; // pop min, push
@@ -4259,6 +5270,10 @@ class index_gt {
 
         // At the very least we are going to explore the starting node and its neighbors
         if (!visits.reserve(config_.connectivity_base + 1u))
+            return false;
+        if (!top.reserve(top_limit))
+            return false;
+        if (!next.reserve(top_limit))
             return false;
 
         // Optional prefetching
@@ -4286,17 +5301,27 @@ class index_gt {
             neighbors_ref_t candidate_neighbors = neighbors_(candidate_ref, level);
             std::size_t const neighbor_count = candidate_neighbors.size();
 
+            compressed_slot_t* sorted_data =
+                sort_neighbors_into_buffer_(candidate_neighbors, neighbor_count, context, neighbor_cmp);
+
             // Optional prefetching
             if (!is_dummy<prefetch_at>()) {
-                candidates_range_t missing_candidates{*this, candidate_neighbors, visits};
-                prefetch(missing_candidates.begin(), missing_candidates.end());
+                if (!is_dummy<neighbor_cmp_at>()) {
+                    sorted_candidates_range_t missing{*this, sorted_data, neighbor_count, visits};
+                    prefetch(missing.begin(), missing.end());
+                } else {
+                    candidates_range_t missing_candidates{*this, candidate_neighbors, visits};
+                    prefetch(missing_candidates.begin(), missing_candidates.end());
+                }
             }
 
             // Assume the worst-case when reserving memory
             if (!visits.reserve(visits.size() + neighbor_count))
                 return false;
 
-            for (compressed_slot_t successor_slot : candidate_neighbors) {
+            for (std::size_t ni = 0; ni < neighbor_count; ++ni) {
+                compressed_slot_t successor_slot =
+                    !is_dummy<neighbor_cmp_at>() ? sorted_data[ni] : candidate_neighbors[ni];
                 if (visits.set(successor_slot))
                     continue;
 
@@ -4321,11 +5346,12 @@ class index_gt {
      *          Locks the nodes in the process, assuming other threads are updating neighbors lists.
      *  @return `true` if procedure succeeded, `false` if run out of memory.
      */
-    template <typename value_at, typename metric_at, typename prefetch_at = dummy_prefetch_t>
+    template <typename value_at, typename metric_at, typename prefetch_at = dummy_prefetch_t,
+              typename neighbor_cmp_at = dummy_neighbor_cmp_t>
     bool search_to_update_(                                           //
         value_at&& query, metric_at&& metric, prefetch_at&& prefetch, //
         compressed_slot_t start_slot, compressed_slot_t updated_slot, level_t level, std::size_t top_limit,
-        context_t& context) noexcept {
+        context_t& context, neighbor_cmp_at&& neighbor_cmp = neighbor_cmp_at{}) noexcept {
 
         visits_hash_set_t& visits = context.visits;
         next_candidates_t& next = context.next_candidates; // pop min, push
@@ -4337,6 +5363,10 @@ class index_gt {
 
         // At the very least we are going to explore the starting node and its neighbors
         if (!visits.reserve(config_.connectivity_base + 1u))
+            return false;
+        if (!top.reserve(top_limit))
+            return false;
+        if (!next.reserve(top_limit))
             return false;
 
         // Optional prefetching
@@ -4375,17 +5405,27 @@ class index_gt {
             neighbors_ref_t candidate_neighbors = neighbors_(candidate_ref, level);
             std::size_t const neighbor_count = candidate_neighbors.size();
 
+            compressed_slot_t* sorted_data =
+                sort_neighbors_into_buffer_(candidate_neighbors, neighbor_count, context, neighbor_cmp);
+
             // Optional prefetching
             if (!is_dummy<prefetch_at>()) {
-                candidates_range_t missing_candidates{*this, candidate_neighbors, visits};
-                prefetch(missing_candidates.begin(), missing_candidates.end());
+                if (!is_dummy<neighbor_cmp_at>()) {
+                    sorted_candidates_range_t missing{*this, sorted_data, neighbor_count, visits};
+                    prefetch(missing.begin(), missing.end());
+                } else {
+                    candidates_range_t missing_candidates{*this, candidate_neighbors, visits};
+                    prefetch(missing_candidates.begin(), missing_candidates.end());
+                }
             }
 
             // Assume the worst-case when reserving memory
             if (!visits.reserve(visits.size() + neighbor_count))
                 return false;
 
-            for (compressed_slot_t successor_slot : candidate_neighbors) {
+            for (std::size_t ni = 0; ni < neighbor_count; ++ni) {
+                compressed_slot_t successor_slot =
+                    !is_dummy<neighbor_cmp_at>() ? sorted_data[ni] : candidate_neighbors[ni];
                 if (visits.set(successor_slot))
                     continue;
 
@@ -4407,79 +5447,27 @@ class index_gt {
         return true;
     }
 
-    // RACORN-1 / ACORN-1 search member functions — see racorn.hpp.
-#include "racorn.hpp"
-
-    /**
-     *  @brief  Standard HNSW search loop for the base layer (no ACORN-1).
-     *  @return `true` if procedure succeeded, `false` if run out of memory.
-     */
-    template <typename value_at, typename metric_at, typename predicate_at, typename prefetch_at>
-    bool search_hnsw_in_base_(                                                                  //
-        value_at&& query, metric_at&& metric, predicate_at&& predicate, prefetch_at&& prefetch, //
-        distance_t& radius, std::size_t top_limit, context_t& context) const usearch_noexcept_m {
-
-        visits_hash_set_t& visits = context.visits;
-        next_candidates_t& next = context.next_candidates;
-        top_candidates_t& top = context.top_candidates;
-
-        while (!next.empty()) {
-            candidate_t candidate = next.top();
-            if ((-candidate.distance) > radius && top.size() == top_limit)
-                break;
-
-            next.pop();
-            context.iteration_cycles++;
-
-            neighbors_ref_t candidate_neighbors = neighbors_base_(node_at_(candidate.slot));
-            std::size_t const neighbor_count = candidate_neighbors.size();
-
-            // Optional prefetching
-            if (!is_dummy<prefetch_at>()) {
-                candidates_range_t missing{*this, candidate_neighbors, visits};
-                prefetch(missing.begin(), missing.end());
-            }
-
-            if (!visits.reserve(visits.size() + neighbor_count))
-                return false;
-
-            for (compressed_slot_t successor_slot : candidate_neighbors) {
-                if (visits.set(successor_slot))
-                    continue;
-
-                distance_t successor_dist = context.measure(query, citerator_at(successor_slot), metric);
-                if (top.size() < top_limit || successor_dist < radius) {
-                    next.insert({-successor_dist, successor_slot});
-                    bool predicate_passes = true;
-                    if (!is_dummy<predicate_at>()) {
-                        ++context.predicate_evaluations;
-                        predicate_passes = predicate(member_cref_t{node_at_(successor_slot).ckey(), successor_slot});
-                    }
-                    if (predicate_passes) {
-                        top.insert({successor_dist, successor_slot}, top_limit);
-                        radius = top.top().distance;
-                    }
-                }
-            }
-        }
-        return true;
-    }
-
-
     /**
      *  @brief  Traverses the @b base layer of a graph, to find a close match.
      *          Doesn't lock any nodes, assuming read-only simultaneous access.
      *  @return `true` if procedure succeeded, `false` if run out of memory.
      */
-    template <typename value_at, typename metric_at, typename predicate_at, typename prefetch_at>
+    template <typename value_at, typename metric_at, typename predicate_at, typename prefetch_at,
+              typename preevaluate_at, typename neighbor_cmp_at>
     bool search_to_find_in_base_(                                                               //
         value_at&& query, metric_at&& metric, predicate_at&& predicate, prefetch_at&& prefetch, //
-        compressed_slot_t start_slot, std::size_t expansion, context_t& context) const usearch_noexcept_m {
+        preevaluate_at&& preevaluate, neighbor_cmp_at&& neighbor_cmp,                           //
+        compressed_slot_t start_slot, std::size_t expansion, context_t& context,
+        early_termination_gate_t& early_termination) const usearch_noexcept_m {
 
         visits_hash_set_t& visits = context.visits;
         next_candidates_t& next = context.next_candidates; // pop min, push
         top_candidates_t& top = context.top_candidates;    // pop max, push
         std::size_t const top_limit = expansion;
+
+        // Base-layer traversal begins here, so this is where the time budget
+        // starts running — the upper-layer descent must not count against it.
+        early_termination.start(context.iteration_cycles);
 
         visits.clear();
         next.clear();
@@ -4496,28 +5484,207 @@ class index_gt {
         next.insert_reserved({-radius, start_slot});
         visits.set(start_slot);
 
-        bool start_predicate_passes = true;
-        if (!is_dummy<predicate_at>()) {
-            ++context.predicate_evaluations;
-            start_predicate_passes = predicate(member_cref_t{node_at_(start_slot).ckey(), start_slot});
+        // Prime the predicate cache for the start slot if preevaluate is provided
+        if (!is_dummy<preevaluate_at>()) {
+            candidate_t start_candidate{radius, start_slot};
+            qualifying_candidates_iterator_t qbegin(*this, &start_candidate);
+            qualifying_candidates_iterator_t qend(*this, &start_candidate + 1);
+            preevaluate(qbegin, qend);
         }
-        if (start_predicate_passes) {
+        bool const start_passes = context.evaluate(predicate, member_cref_t{node_at_(start_slot).ckey(), start_slot});
+        if (start_passes) {
             usearch_assert_m(top.capacity(),
                              "The `sorted_buffer_gt` must have been reserved in the search entry point");
             top.insert_reserved({radius, start_slot});
         }
 
-        // Dispatch to ACORN-1 or standard HNSW search loop
-        if (context.two_hop_threshold >= 0 && !is_dummy<predicate_at>()) {
-            if (!search_acorn1_in_base_(query, metric, predicate, prefetch, radius, top_limit, context))
-                return false;
-        } else {
-            if (!search_hnsw_in_base_(query, metric, predicate, prefetch, radius, top_limit, context))
-                return false;
+        // ---- ACORN-1 vs HNSW dispatch via filter-first threshold ----
+        //
+        // The threshold acts as a gate that decides which search loop to run
+        // for the rest of this query:
+        //   * `>= 1.0`     -> always ACORN-1.
+        //   * `< 0.0`      -> always HNSW ("ACORN off", the `-1` sentinel).
+        //   * `[0.0, 1.0)` -> probe the entry's 1-hop + 2-hop neighborhood and
+        //                      measure the filter pass ratio. Pick ACORN-1 only
+        //                      when the ratio is at or below the threshold.
+        //                      `0.0` is included because the measured ratio can
+        //                      itself be 0 at very low selectivity.
+        // Effective only when a predicate is supplied; otherwise HNSW is run.
+        if (!is_dummy<predicate_at>()) {
+            // ---- NaviX heuristic dispatch (overrides filter-first/ACORN) ----
+            if (context.navix_heuristic != 0)
+                return search_navix_in_base_(query, metric, predicate, prefetch, radius, top_limit, context,
+                                             early_termination);
+
+            double const ff_threshold = context.filter_first_threshold;
+            bool use_acorn = false;
+            if (ff_threshold >= 1.0) {
+                use_acorn = true;
+            } else if (ff_threshold >= 0.0) {
+                // Probe the entry neighborhood and route to ACORN-1 only when
+                // the filter is selective enough (ratio at or below threshold).
+                double const ratio =
+                    entry_filter_pass_ratio_(predicate, preevaluate, neighbor_cmp, start_slot, start_passes, context);
+                use_acorn = ratio <= ff_threshold;
+            }
+
+            if (use_acorn) {
+                if (!search_acorn1_in_base_(query, metric, predicate, prefetch, preevaluate, neighbor_cmp, radius,
+                                            top_limit, context, early_termination))
+                    return false;
+                return true;
+            }
         }
+
+        // Which of the three exits the loop takes; counted once per query below.
+        enum { stop_queue = 0, stop_rule = 1, stop_deadline = 2 } stop = stop_queue;
+        std::size_t const dist0 = context.computed_distances, pred0 = context.predicate_evaluations;
+        bool fill_marked = false; // prefill sums are settled once, on the first cycle that starts with W full
+        while (!next.empty()) {
+
+            candidate_t candidate = next.top();
+            if ((-candidate.distance) > radius && top.size() == top_limit) {
+                stop = stop_rule;
+                break;
+            }
+
+            if (early_termination.should_terminate(context.iteration_cycles, top.size(), top_limit)) {
+                stop = stop_deadline;
+                break;
+            }
+
+            next.pop();
+            context.iteration_cycles++;
+            // Base-layer cycles only, so that `iteration_cycles` minus this is the
+            // entry descent. Counted on both paths so the two are comparable.
+            context.expansion_cycles++;
+            if (top.size() < top_limit) {
+                context.cycles_prefill++;
+            } else if (!fill_marked) {
+                context.dist_prefill += context.computed_distances - dist0;
+                context.pred_prefill += context.predicate_evaluations - pred0;
+                // One clock read per query at most: this branch runs once.
+                context.prefill_ms = early_termination.elapsed_ms();
+                snapshot_fill_(context, top);
+                fill_marked = true;
+            }
+
+            neighbors_ref_t candidate_neighbors = neighbors_base_(node_at_(candidate.slot));
+            std::size_t const neighbor_count = candidate_neighbors.size();
+
+            compressed_slot_t* sorted_data =
+                sort_neighbors_into_buffer_(candidate_neighbors, neighbor_count, context, neighbor_cmp);
+
+            // Optional prefetching
+            if (!is_dummy<prefetch_at>()) {
+                if (!is_dummy<neighbor_cmp_at>()) {
+                    sorted_candidates_range_t missing{*this, sorted_data, neighbor_count, visits};
+                    prefetch(missing.begin(), missing.end());
+                } else {
+                    candidates_range_t missing{*this, candidate_neighbors, visits};
+                    prefetch(missing.begin(), missing.end());
+                }
+            }
+
+            // Assume the worst-case when reserving memory
+            if (!visits.reserve(visits.size() + neighbor_count))
+                return false;
+
+            if (!is_dummy<preevaluate_at>()) {
+                // --- Preevaluate path: collect qualifying candidates, batch preevaluate, then predicate ---
+                buffer_gt<candidate_t>& qualifying = context.qualifying_candidates;
+                std::size_t qualifying_count = 0;
+
+                for (std::size_t ni = 0; ni < neighbor_count; ++ni) {
+                    compressed_slot_t successor_slot =
+                        !is_dummy<neighbor_cmp_at>() ? sorted_data[ni] : candidate_neighbors[ni];
+                    if (visits.set(successor_slot))
+                        continue;
+
+                    distance_t successor_dist = context.measure(query, citerator_at(successor_slot), metric);
+                    if (top.size() < top_limit || successor_dist < radius) {
+                        next.insert({-successor_dist, successor_slot});
+                        qualifying[qualifying_count++] = {successor_dist, successor_slot};
+                    }
+                }
+
+                if (qualifying_count > 0) {
+                    qualifying_candidates_iterator_t qbegin(*this, qualifying.data());
+                    qualifying_candidates_iterator_t qend(*this, qualifying.data() + qualifying_count);
+                    preevaluate(qbegin, qend);
+
+                    for (std::size_t i = 0; i < qualifying_count; ++i) {
+                        if (context.evaluate(predicate,
+                                             member_cref_t{node_at_(qualifying[i].slot).ckey(), qualifying[i].slot})) {
+                            top.insert({qualifying[i].distance, qualifying[i].slot}, top_limit);
+                            radius = top.top().distance;
+                        }
+                    }
+                }
+            } else {
+                // --- Single predicate path ---
+                for (std::size_t ni = 0; ni < neighbor_count; ++ni) {
+                    compressed_slot_t successor_slot =
+                        !is_dummy<neighbor_cmp_at>() ? sorted_data[ni] : candidate_neighbors[ni];
+                    if (visits.set(successor_slot))
+                        continue;
+
+                    distance_t successor_dist = context.measure(query, citerator_at(successor_slot), metric);
+                    if (top.size() < top_limit || successor_dist < radius) {
+                        next.insert({-successor_dist, successor_slot});
+                        if (context.evaluate(predicate,
+                                             member_cref_t{node_at_(successor_slot).ckey(), successor_slot})) {
+                            top.insert({successor_dist, successor_slot}, top_limit);
+                            radius = top.top().distance;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (!fill_marked) { // W never filled: the whole loop was prefill
+            context.dist_prefill += context.computed_distances - dist0;
+            context.pred_prefill += context.predicate_evaluations - pred0;
+        }
+        context.dist_base += context.computed_distances - dist0;
+        context.pred_base += context.predicate_evaluations - pred0;
+        if (stop == stop_rule)
+            context.stop_radius++;
+        else if (stop == stop_deadline)
+            context.stop_budget++;
+        else
+            context.stop_queue_empty++;
+        if (top.size() < top_limit)
+            context.never_full++;
 
         return true;
     }
+
+    /// @brief Copies `W` into the context for `search_result_t::fill_at` when the search config
+    ///        asked for it (`fill_snapshot`). Called once per query, on the first base-layer cycle
+    ///        that begins with `W` full, right after `prefill_ms` is read.
+    void snapshot_fill_(context_t& context, top_candidates_t const& top) const noexcept {
+        if (!context.fill_snapshot_on)
+            return;
+        std::size_t const n = top.size();
+        if (context.fill_snapshot.size() < n) {
+            context.fill_snapshot = buffer_gt<candidate_t>(n);
+            if (!context.fill_snapshot)
+                return;
+        }
+        candidate_t const* src = top.data();
+        for (std::size_t i = 0; i != n; ++i)
+            context.fill_snapshot[i] = src[i];
+        context.fill_snapshot_size = n;
+    }
+
+    // The filtered-search paths that this fork adds to USearch live in two
+    // class-body fragments. This file thus keeps the HNSW core and the plumbing:
+    // config knobs, per-thread scratch and counters, buffer sizing, and the
+    // dispatch in `search_to_find_in_base_`. Both fragments are private members
+    // of `index_gt`, exactly as if written here.
+#include "racorn.hpp" // ACORN-1 / RACORN-1: entry probe, base loop, 2-hop and 3-hop expansion, bridges
+#include "navix.hpp"  // NaviX heuristics (onehop-s / blind / directed / adaptive-local)
 
     /**
      *  @brief  Iterates through all members, without actually touching the index.
@@ -4530,14 +5697,10 @@ class index_gt {
         top_candidates_t& top = context.top_candidates;
         top.clear();
         top.reserve(count);
-        if (!is_dummy<predicate_at>()) {
-            context.predicate_evaluations += size();
-        }
         for (std::size_t i = 0; i != size(); ++i) {
             auto slot = static_cast<compressed_slot_t>(i);
-            if (!is_dummy<predicate_at>()) {
-                if (!predicate(at(slot)))
-                    continue;
+            if (!context.evaluate(predicate, at(slot))) {
+                continue;
             }
 
             distance_t distance = context.measure(query, citerator_at(slot), metric);
@@ -4587,7 +5750,7 @@ class index_gt {
         metric_at&& metric,                                            //
         std::size_t needed, top_candidates_t& top, context_t& context, //
         std::size_t& refines_counter,                                  //
-        compressed_slot_t override_slot = (std::numeric_limits<compressed_slot_t>::max)(),
+        compressed_slot_t override_slot = ((std::numeric_limits<compressed_slot_t>::max))(),
         override_value_at override_value = {}) const noexcept {
 
         // Avoid expensive computation, if the set is already small
@@ -4598,6 +5761,13 @@ class index_gt {
 
         // Sort before processing
         top.sort_ascending();
+
+        // Pruning-free construction: keep the `needed` nearest candidates,
+        // skipping the diversity heuristic below (see `index_config_t::pruning_free`).
+        if (config_.pruning_free) {
+            top.shrink(needed);
+            return {top_data, needed};
+        }
 
         std::size_t submitted_count = 1;
         std::size_t consumed_count = 1; /// Always equal or greater than `submitted_count`.
@@ -4699,7 +5869,7 @@ static join_result_t join(               //
         return result.failed("Can't join with itself, consider copying");
 
     if (config.max_proposals == 0)
-        config.max_proposals = std::log(men.size()) + executor.size();
+        config.max_proposals = static_cast<std::size_t>(std::log(men.size())) + executor.size();
 
     using proposals_count_t = std::uint16_t;
     config.max_proposals = (std::min)(men.size(), config.max_proposals);
