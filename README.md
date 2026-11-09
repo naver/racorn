@@ -13,14 +13,17 @@ the drivers. The L2 and cosine distances of `f32` vectors use the AVX2 kernels o
 ## Paper and citation
 
 Yoonseok Kim and Gyusik Choe. *RACORN: Robust Predicate-Agnostic Filtered Vector Search under
-Extreme Selectivity.* Under submission, 2026.
+Extreme Selectivity.* arXiv:2607.00768, 2026. <https://arxiv.org/abs/2607.00768>
 
 ```bibtex
-@unpublished{kim2026racorn,
-  title  = {{RACORN}: Robust Predicate-Agnostic Filtered Vector Search under Extreme Selectivity},
-  author = {Kim, Yoonseok and Choe, Gyusik},
-  year   = {2026},
-  note   = {Under submission},
+@misc{kim2026racorn,
+  title         = {{RACORN}: Robust Predicate-Agnostic Filtered Vector Search under Extreme Selectivity},
+  author        = {Kim, Yoonseok and Choe, Gyusik},
+  year          = {2026},
+  eprint        = {2607.00768},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.DB},
+  url           = {https://arxiv.org/abs/2607.00768},
 }
 ```
 
